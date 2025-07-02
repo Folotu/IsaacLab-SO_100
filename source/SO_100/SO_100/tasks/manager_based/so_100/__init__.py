@@ -21,3 +21,14 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+# Register the SO-100 Cube Lift Play environment (with smaller scene)
+gym.register(
+    id="Template-So-100-CubeLift-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.so_100_cube_lift_env_cfg:SO100CubeLiftEnvCfg_PLAY",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+    },
+    disable_env_checker=True,
+)

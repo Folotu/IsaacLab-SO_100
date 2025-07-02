@@ -1,30 +1,7 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
-
-"""Script to train an RL agent with skrl.
-
-This script is an example of how to train a reinforcement learning (RL) agent with skrl in Isaac Lab.
-
-It is designed to be used with the `rl_games_train.sh` script. This script will launch the training script
-with the correct arguments, and will also handle the multi-node training case.
-
-.. code-block:: bash
-
-    # single-gpu
-    ./rl_games_train.sh --task Isaac-Ant-v0
-
-    # multi-gpu
-    ./rl_games_train.sh --task Isaac-Ant-v0 --num_gpus 2
-
-"""
-
-
 import argparse
 import sys
 
-from omni.isaac.lab.app import AppLauncher
+from isaaclab.app import AppLauncher
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with skrl.")
@@ -38,8 +15,8 @@ parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint to resume training.")
-parser.add_argument("--logdir", type=str, default=None, help="Root directory for logging.")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument("--logdir", type=str, default=None, help="Path to the directory where checkpoints will be saved.")
 parser.add_argument(
     "--ml_framework",
     type=str,
@@ -57,10 +34,8 @@ parser.add_argument(
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
-
 # parse the arguments
 args_cli, hydra_args = parser.parse_known_args()
-
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
@@ -114,84 +89,110 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import SO_100.tasks  # noqa: F401
 
+# config shortcuts
+algorithm = args_cli.algorithm.lower()
+agent_cfg_entry_point = "skrl_cfg_entry_point" if algorithm in ["ppo"] else f"skrl_{algorithm}_cfg_entry_point"
 
-def main():
+gym.pprint_registry()
+
+@hydra_task_config(args_cli.task, agent_cfg_entry_point)
+def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict):
     """Train with skrl agent."""
-    # hydra configuration
-    @hydra_task_config
-    def hydra_main(cfg: dict):
-        # print configuration
-        print_dict(cfg)
+    # override configurations with non-hydra CLI arguments
+    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
-        # multi-agent to single-agent environment
-        if "multi_agent" in cfg and cfg["multi_agent"]:
-            # check if the task is a multi-agent environment
-            if not issubclass(cfg["task"]["class"], DirectMARLEnv):
-                raise ValueError(
-                    f"The task {cfg['task']['name']} is not a multi-agent environment. "
-                    f"Please set the 'multi_agent' flag to False."
-                )
-            # update number of agents
-            cfg["task"]["env"]["num_agents"] = cfg["task"]["num_agents"]
-            # create a single-agent environment from a multi-agent environment
-            env = multi_agent_to_single_agent(gym.make(cfg["task"]["name"], cfg=cfg["task"]["env"], **cfg["render"]))
-        else:
-            # create environment
-            env = gym.make(cfg["task"]["name"], cfg=cfg["task"]["env"], **cfg["render"])
+    # multi-gpu training config
+    if args_cli.distributed:
+        env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
+    # max iterations for training
+    if args_cli.max_iterations:
+        agent_cfg["trainer"]["timesteps"] = args_cli.max_iterations * agent_cfg["agent"]["rollouts"]
+    agent_cfg["trainer"]["close_environment_at_exit"] = False
+    # configure the ML framework into the global skrl variable
+    if args_cli.ml_framework.startswith("jax"):
+        skrl.config.jax.backend = "jax" if args_cli.ml_framework == "jax" else "numpy"
 
-        # wrap the environment for skrl
-        env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)
+    # randomly sample a seed if seed = -1
+    if args_cli.seed == -1:
+        args_cli.seed = random.randint(0, 10000)
 
-        # log directory
-        if args_cli.logdir is None:
-            log_dir = os.path.join("logs", cfg["task"]["name"], args_cli.algorithm)
-            if args_cli.distributed:
-                log_dir = os.path.join(log_dir, f"distributed_seed_{args_cli.seed}")
-            else:
-                log_dir = os.path.join(log_dir, f"seed_{args_cli.seed}")
-            # add timestamp to log directory
-            log_dir = os.path.join(log_dir, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
-        else:
-            log_dir = args_cli.logdir
+    # set the agent and environment seed from command line
+    # note: certain randomization occur in the environment initialization so we set the seed here
+    agent_cfg["seed"] = args_cli.seed if args_cli.seed is not None else agent_cfg["seed"]
+    env_cfg.seed = agent_cfg["seed"]
 
-        # create a temporary directory for the rl-games configuration
-        # this is needed because the rl-games runner only accepts a path to a configuration file
-        # and hydra does not save the configuration file until the end of the training
-        # so we need to save the configuration file ourselves
-        os.makedirs(log_dir, exist_ok=True)
-        # save the configuration file
-        config_path = os.path.join(log_dir, "config.yaml")
-        dump_yaml(config_path, cfg)
-        # save the task configuration file
-        task_cfg_path = os.path.join(log_dir, "task.pkl")
-        dump_pickle(task_cfg_path, cfg["task"])
+    # specify directory for logging experiments
+    if args_cli.logdir:
+        # use the custom log directory if provided
+        log_dir = os.path.abspath(args_cli.logdir)
+        agent_cfg["agent"]["experiment"]["directory"] = log_dir
+        agent_cfg["agent"]["experiment"]["experiment_name"] = ""
+    else:
+        # use the default timestamped directory
+        log_root_path = os.path.join("logs", "skrl", agent_cfg["agent"]["experiment"]["directory"])
+        log_root_path = os.path.abspath(log_root_path)
+        log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + f"_{algorithm}_{args_cli.ml_framework}"
+        if agent_cfg["agent"]["experiment"]["experiment_name"]:
+            log_dir += f'_{agent_cfg["agent"]["experiment"]["experiment_name"]}'
+        # set directory into agent config
+        agent_cfg["agent"]["experiment"]["directory"] = log_root_path
+        agent_cfg["agent"]["experiment"]["experiment_name"] = log_dir
+        # update log_dir
+        log_dir = os.path.join(log_root_path, log_dir)
 
-        # get the path to the skrl configuration file
-        # if the path is not absolute, it is assumed to be relative to the task's config directory
-        skrl_config_path = cfg["rl_games"].pop("config_path")
-        if not os.path.isabs(skrl_config_path):
-            skrl_config_path = os.path.join(os.path.dirname(cfg["task"]["config_path"]), skrl_config_path)
+    print(f"[INFO] Logging experiment in directory: {log_dir}")
 
-        # create runner
-        runner = Runner(env, args=args_cli, agent_class=args_cli.algorithm, agent_config=skrl_config_path)
-        # configure and launch the runner
-        runner.configure(log_dir, checkpoint=args_cli.checkpoint)
-        runner.launch()
+    # dump the configuration into log-directory
+    os.makedirs(os.path.join(log_dir, "params"), exist_ok=True)
+    dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
+    dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+    dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
+    dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
-    # run the training
-    hydra_main()
+    # get checkpoint path (to resume training)
+    resume_path = retrieve_file_path(args_cli.checkpoint) if args_cli.checkpoint else None
 
-    # close the environment
+    # create isaac environment
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
+    # wrap for video recording
+    if args_cli.video:
+        video_kwargs = {
+            "video_folder": os.path.join(log_dir, "videos", "train"),
+            "step_trigger": lambda step: step % args_cli.video_interval == 0,
+            "video_length": args_cli.video_length,
+            "disable_logger": True,
+        }
+        print("[INFO] Recording videos during training.")
+        print_dict(video_kwargs, nesting=4)
+        env = gym.wrappers.RecordVideo(env, **video_kwargs)
+
+    # convert to single-agent instance if required by the RL algorithm
+    if isinstance(env.unwrapped, DirectMARLEnv) and algorithm in ["ppo"]:
+        env = multi_agent_to_single_agent(env)
+
+    # wrap around environment for skrl
+    env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)  # same as: `wrap_env(env, wrapper="auto")`
+
+    # configure and instantiate the skrl runner
+    # https://skrl.readthedocs.io/en/latest/api/utils/runner.html
+    runner = Runner(env, agent_cfg)
+
+    # load checkpoint (if specified)
+    if resume_path:
+        print(f"[INFO] Loading model checkpoint from: {resume_path}")
+        runner.agent.load(resume_path)
+
+    # run training
+    runner.run()
+
+    # close the simulator
     env.close()
 
 
 if __name__ == "__main__":
-    # set random seed
-    if args_cli.seed is None:
-        args_cli.seed = random.randint(0, 1000000)
-
     # run the main function
     main()
-
-    # close the simulation
+    # close sim app
     simulation_app.close()
