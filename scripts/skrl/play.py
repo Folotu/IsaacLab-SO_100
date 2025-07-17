@@ -98,109 +98,61 @@ algorithm = args_cli.algorithm.lower()
 
 
 def main():
-    """Play with skrl agent."""
+    """Play a trained policy from a checkpoint."""
+    # parse configuration
+    env_cfg = parse_env_cfg(
+        args_cli.task,
+        use_gpu=not args_cli.device == "cpu",
+        num_envs=args_cli.num_envs,
+        use_fabric=not args_cli.disable_fabric,
+    )
+
+    # get checkpoint path
+    if args_cli.use_pretrained_checkpoint:
+        # get the checkpoint path for the pretrained model
+        checkpoint_path = get_published_pretrained_checkpoint(args_cli.task, "skrl", args_cli.algorithm)
+    else:
+        # get the checkpoint path for the trained model
+        checkpoint_path = get_checkpoint_path(args_cli.checkpoint, "skrl", args_cli.algorithm)
+
+    # load agent configuration
+    agent_cfg_entry_point = "skrl_cfg_entry_point" if algorithm in ["ppo"] else f"skrl_{algorithm}_cfg_entry_point"
+    agent_cfg = load_cfg_from_registry(args_cli.task, agent_cfg_entry_point)
+
     # configure the ML framework into the global skrl variable
     if args_cli.ml_framework.startswith("jax"):
         skrl.config.jax.backend = "jax" if args_cli.ml_framework == "jax" else "numpy"
 
-    # parse configuration
-    env_cfg = parse_env_cfg(
-        args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs, use_fabric=not args_cli.disable_fabric
-    )
-    try:
-        experiment_cfg = load_cfg_from_registry(args_cli.task, f"skrl_{algorithm}_cfg_entry_point")
-    except ValueError:
-        experiment_cfg = load_cfg_from_registry(args_cli.task, "skrl_cfg_entry_point")
-
-    # specify directory for logging experiments (load checkpoint)
-    log_root_path = os.path.join("logs", "skrl", experiment_cfg["agent"]["experiment"]["directory"])
-    log_root_path = os.path.abspath(log_root_path)
-    print(f"[INFO] Loading experiment from directory: {log_root_path}")
-    # get checkpoint path
-    if args_cli.use_pretrained_checkpoint:
-        resume_path = get_published_pretrained_checkpoint("skrl", args_cli.task)
-        if not resume_path:
-            print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
-            return
-    elif args_cli.checkpoint:
-        resume_path = os.path.abspath(args_cli.checkpoint)
-    else:
-        resume_path = get_checkpoint_path(
-            log_root_path, run_dir=f".*_{algorithm}_{args_cli.ml_framework}", other_dirs=["checkpoints"]
-        )
-    log_dir = os.path.dirname(os.path.dirname(resume_path))
-
     # create isaac environment
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="human")
+
+    # wrap for video recording
+    if args_cli.video:
+        video_kwargs = {
+            "video_folder": os.path.join(os.path.dirname(checkpoint_path), "videos", "play"),
+            "step_trigger": lambda step: step == 0,
+            "video_length": args_cli.video_length,
+            "disable_logger": True,
+        }
+        print("[INFO] Recording videos during playback.")
+        print_dict(video_kwargs, nesting=4)
+        env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv) and algorithm in ["ppo"]:
         env = multi_agent_to_single_agent(env)
 
-    # get environment (step) dt for real-time evaluation
-    try:
-        dt = env.step_dt
-    except AttributeError:
-        dt = env.unwrapped.step_dt
-
-    # wrap for video recording
-    if args_cli.video:
-        video_kwargs = {
-            "video_folder": os.path.join(log_dir, "videos", "play"),
-            "step_trigger": lambda step: step == 0,
-            "video_length": args_cli.video_length,
-            "disable_logger": True,
-        }
-        print("[INFO] Recording videos during training.")
-        print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
-
     # wrap around environment for skrl
-    env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)  # same as: `wrap_env(env, wrapper="auto")`
+    env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)
 
-    # configure and instantiate the skrl runner
-    # https://skrl.readthedocs.io/en/latest/api/utils/runner.html
-    experiment_cfg["trainer"]["close_environment_at_exit"] = False
-    experiment_cfg["agent"]["experiment"]["write_interval"] = 0  # don't log to TensorBoard
-    experiment_cfg["agent"]["experiment"]["checkpoint_interval"] = 0  # don't generate checkpoints
-    runner = Runner(env, experiment_cfg)
+    # instantiate the agent
+    runner = Runner(env, agent_cfg)
+    runner.agent.load(checkpoint_path)
 
-    print(f"[INFO] Loading model checkpoint from: {resume_path}")
-    runner.agent.load(resume_path)
-    # set agent to evaluation mode
-    runner.agent.set_running_mode("eval")
+    # play the agent
+    runner.eval(episodes=-1)
 
-    # reset environment
-    obs, _ = env.reset()
-    timestep = 0
-    # simulate environment
-    while simulation_app.is_running():
-        start_time = time.time()
-
-        # run everything in inference mode
-        with torch.inference_mode():
-            # agent stepping
-            outputs = runner.agent.act(obs, timestep=0, timesteps=0)
-            # - multi-agent (deterministic) actions
-            if hasattr(env, "possible_agents"):
-                actions = {a: outputs[-1][a].get("mean_actions", outputs[0][a]) for a in env.possible_agents}
-            # - single-agent (deterministic) actions
-            else:
-                actions = outputs[-1].get("mean_actions", outputs[0])
-            # env stepping
-            obs, _, _, _, _ = env.step(actions)
-        if args_cli.video:
-            timestep += 1
-            # exit the play loop after recording one video
-            if timestep == args_cli.video_length:
-                break
-
-        # time delay for real-time evaluation
-        sleep_time = dt - (time.time() - start_time)
-        if args_cli.real_time and sleep_time > 0:
-            time.sleep(sleep_time)
-
-    # close the simulator
+    # close the environment
     env.close()
 
 
