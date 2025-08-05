@@ -56,7 +56,7 @@ _build
 # RL-Games and Training
 runs/
 recordings/
-logs/*
+**/logs/*
 !logs/
 !logs/skrl/
 !logs/skrl/SO100_lift/

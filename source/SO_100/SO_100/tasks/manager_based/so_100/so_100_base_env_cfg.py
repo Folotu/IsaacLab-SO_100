@@ -23,6 +23,7 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 from . import mdp
 
+
 ##
 # Scene definition
 ##
@@ -123,6 +124,7 @@ class EventCfg:
 
     reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
 
+
     # reset_object_position = EventTerm(
     #     func=mdp.reset_root_state_uniform,
     #     mode="reset",
@@ -143,6 +145,7 @@ class RewardsCfg:
 
     # Lifting reward with higher weight
     lifting_object = RewTerm(func=mdp.object_is_lifted, params={"minimal_height": 0.02}, weight=25.0)
+    object_height = RewTerm(func=mdp.object_height_reward, weight=25.0)
 
     # Action penalty to encourage smooth movements
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
@@ -235,6 +238,7 @@ class SO100LiftEnvCfg(ManagerBasedRLEnvCfg):
         
         # Configure camera for closer view during video recording
         self.viewer.eye = (1.0, 1.0, 0.8)
+
         self.viewer.lookat = (0.5, 0.0, 0.2)
         self.viewer.origin_type = "env"
         self.viewer.env_index = 0

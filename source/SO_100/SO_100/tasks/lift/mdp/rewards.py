@@ -25,19 +25,6 @@ def object_is_lifted(
     return torch.where(object.data.root_pos_w[:, 2] > minimal_height, 1.0, 0.0)
 
 
-def object_height_reward(
-    env: ManagerBasedRLEnv, object_cfg: SceneEntityCfg = SceneEntityCfg("object")
-) -> torch.Tensor:
-    """Reward the agent for increasing the object's height.
-
-    This provides a dense reward to guide the agent towards lifting the object.
-    It rewards the absolute height of the object.
-    """
-    object: RigidObject = env.scene[object_cfg.name]
-    # Reward the absolute height of the object.
-    return object.data.root_pos_w[:, 2]
-
-
 def object_ee_distance(
     env: ManagerBasedRLEnv,
     std: float,

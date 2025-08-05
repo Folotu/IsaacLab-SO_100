@@ -54,6 +54,7 @@ import os
 import random
 from datetime import datetime
 
+import torch
 import skrl
 from packaging import version
 
@@ -79,8 +80,9 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.assets import retrieve_file_path
-from isaaclab.utils.dict import print_dict
+
 from isaaclab.utils.io import dump_pickle, dump_yaml
+from isaaclab.utils.dict import print_dict
 
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
 
@@ -125,9 +127,36 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # specify directory for logging experiments
     if args_cli.logdir:
         # use the custom log directory if provided
-        log_dir = os.path.abspath(args_cli.logdir)
-        agent_cfg["agent"]["experiment"]["directory"] = log_dir
-        agent_cfg["agent"]["experiment"]["experiment_name"] = ""
+        log_root_path = os.path.abspath(args_cli.logdir)
+        # create a timestamped directory for the experiment
+        # only rank 0 creates the directory
+                # get rank of the process
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            device = f"cuda:{rank}"
+        else:
+            rank = 0
+            device = "cuda:0"
+
+        # only rank 0 creates the directory
+        if rank == 0:
+            experiment_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + f"_{algorithm}_{args_cli.ml_framework}"
+            if agent_cfg["agent"]["experiment"]["experiment_name"]:
+                experiment_name += f'_{agent_cfg["agent"]["experiment"]["experiment_name"]}'
+        else:
+            experiment_name = ""
+            print("rank other than 0: ", rank)
+        # broadcast the experiment name to all other ranks
+        if torch.distributed.is_initialized():
+            experiment_name_tensor = torch.tensor(list(map(ord, experiment_name)), dtype=torch.int8, device=device)
+            torch.distributed.broadcast(experiment_name_tensor, src=0)
+            experiment_name = "".join(map(chr, experiment_name_tensor.tolist()))
+
+        # set directory into agent config
+        agent_cfg["agent"]["experiment"]["directory"] = log_root_path
+        agent_cfg["agent"]["experiment"]["experiment_name"] = experiment_name
+        # update log_dir for our own use (e.g. video)
+        log_dir = os.path.join(log_root_path, experiment_name)
     else:
         # use the default timestamped directory
         log_root_path = os.path.join("logs", "skrl", agent_cfg["agent"]["experiment"]["directory"])
@@ -158,8 +187,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # wrap for video recording
     if args_cli.video:
+        # get the final directory where logs are saved
+        if agent_cfg["agent"]["experiment"]["directory"]:
+            log_dir = os.path.join(agent_cfg["agent"]["experiment"]["directory"], 
+                                 agent_cfg["agent"]["experiment"]["experiment_name"])
         video_kwargs = {
-            "video_folder": os.path.join(log_dir, "videos", "train"),
+            "video_folder": os.path.join(log_dir, "videos"),
             "step_trigger": lambda step: step % args_cli.video_interval == 0,
             "video_length": args_cli.video_length,
             "disable_logger": True,
