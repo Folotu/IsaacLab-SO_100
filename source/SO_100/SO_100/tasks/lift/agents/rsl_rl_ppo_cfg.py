@@ -20,6 +20,7 @@ class LiftCubePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         actor_hidden_dims=[256, 128, 64],
         critic_hidden_dims=[256, 128, 64],
         activation="elu",
+        noise_std_type="log",  # Pass through as kwargs to fix negative std issue
     )
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,

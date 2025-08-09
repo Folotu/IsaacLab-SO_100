@@ -5,6 +5,9 @@
 
 from dataclasses import MISSING
 
+import os
+import math
+import torch
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, DeformableObjectCfg, RigidObjectCfg, RigidObjectCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
@@ -38,7 +41,7 @@ from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
 # from isaaclab.utils.assets import RigidBodyPropertiesCfg
 
 
-# from . import mdp
+from . import mdp as local_mdp
 import isaaclab_tasks.manager_based.manipulation.lift.mdp as mdp
 
 from SO_100.robots import SO_ARM100_CFG
@@ -160,9 +163,20 @@ class EventCfg:
 class RewardsCfg:
     """Reward terms for the MDP."""
 
+    # Dense reaching reward - matches working reference configuration
     reaching_object = RewTerm(func=mdp.object_ee_distance, params={"std": 0.1}, weight=1.0)
 
-    lifting_object = RewTerm(func=mdp.object_is_lifted, params={"minimal_height": 0.04}, weight=15.0)
+    # Main lifting reward - matches working reference configuration  
+    lifting_object = RewTerm(func=mdp.object_is_lifted, params={"minimal_height": 0.025}, weight=15.0)
+
+    # Progressive lifting reward - encourages any upward movement (reduced weight to avoid spiky dominance)
+    # object_height_progress = RewTerm(func=local_mdp.object_height_progress, weight=2.0)
+
+    # # Gripper closure reward when near object
+    # gripper_close_to_object = RewTerm(func=local_mdp.gripper_close_to_object, weight=3.0)
+
+    # # Orientation reward - encourage proper gripper alignment
+    # gripper_orientation = RewTerm(func=local_mdp.gripper_orientation, weight=2.0)
 
     object_goal_tracking = RewTerm(
         func=mdp.object_goal_distance,
@@ -176,9 +190,8 @@ class RewardsCfg:
         weight=5.0,
     )
 
-    # action penalty
+    # Action penalties for smooth control
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
-
     joint_vel = RewTerm(
         func=mdp.joint_vel_l2,
         weight=-1e-4,
@@ -204,6 +217,8 @@ class CurriculumCfg:
     action_rate = CurrTerm(
         func=mdp.modify_reward_weight, params={"term_name": "action_rate", "weight": -1e-1, "num_steps": 10000}
     )
+
+    # Note: Keep dense reaching reward throughout early learning; remove reaching decay to avoid premature signal loss
 
     joint_vel = CurrTerm(
         func=mdp.modify_reward_weight, params={"term_name": "joint_vel", "weight": -1e-1, "num_steps": 10000}
@@ -240,6 +255,30 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
         # simulation settings
         self.sim.dt = 0.01  # 100Hz
         self.sim.render_interval = self.decimation
+
+        # Dynamically determine per-rank number of environments to keep total global envs constant
+        # Priority of env vars for total desired envs: TOTAL_ENVS > NUM_ENVS > default 4096
+        try:
+            total_envs = int(os.getenv("TOTAL_ENVS") or os.getenv("NUM_ENVS") or 4096)
+        except Exception:
+            total_envs = 4096
+        try:
+            world_size = int(os.getenv("WORLD_SIZE") or 1)
+        except Exception:
+            world_size = 1
+        per_rank_envs = max(1, (total_envs + world_size - 1) // world_size)
+        # Override the scene's num_envs set at construction time
+        self.scene.num_envs = per_rank_envs
+        # Optional sanity logging
+        if os.getenv("LIFT_ENV_DEBUG", "0") == "1":
+            rank_env = os.getenv("RANK") or os.getenv("LOCAL_RANK") or "0"
+            try:
+                rank_env = int(rank_env)
+            except Exception:
+                rank_env = rank_env
+            print(
+                f"[LiftEnvCfg] WORLD_SIZE={world_size} RANK={rank_env} TOTAL_ENVS={total_envs} "
+                f"PER_RANK_ENVs={per_rank_envs} SCENE.num_envs={self.scene.num_envs}")
 
         self.sim.physx.bounce_threshold_velocity = 0.2
         self.sim.physx.bounce_threshold_velocity = 0.01
