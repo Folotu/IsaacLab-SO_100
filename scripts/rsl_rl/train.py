@@ -71,6 +71,7 @@ if args_cli.distributed and version.parse(installed_version) < version.parse(RSL
 """Rest everything follows."""
 
 import os
+import sys
 from datetime import datetime
 
 import gymnasium as gym
@@ -123,46 +124,129 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         agent_cfg.seed = seed
 
     # specify directory for logging experiments
-    if args_cli.logdir:
-        log_root_path = os.path.abspath(args_cli.logdir)
-        # get rank of the process
-        if torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
-            device = f"cuda:{app_launcher.local_rank}"
+    # determine rank based on distributed training setup
+    if args_cli.distributed:
+        # Use AWS Batch environment variables directly - more reliable than our exports
+        aws_node_index = os.environ.get('AWS_BATCH_JOB_NODE_INDEX')
+        if aws_node_index is not None:
+            node_rank = int(aws_node_index)
         else:
-            rank = 0
-            device = "cpu"
-        # only rank 0 creates the unique directory name
-        if rank == 0:
+            # Fallback to our exported NODE_RANK or default to 0
+            node_rank = int(os.environ.get('NODE_RANK', 0))
+        
+        local_rank = app_launcher.local_rank
+        # global rank = node_rank * processes_per_node + local_rank
+        # for single GPU per node: global_rank = node_rank
+        rank = node_rank
+        device = f"cuda:{local_rank}"
+        print(f"[DEBUG] AWS Batch variables: AWS_BATCH_JOB_NODE_INDEX='{os.environ.get('AWS_BATCH_JOB_NODE_INDEX', 'NOT_SET')}', NODE_RANK='{os.environ.get('NODE_RANK', 'NOT_SET')}', CHECKPOINT_LOGDIR='{os.environ.get('CHECKPOINT_LOGDIR', 'NOT_SET')}'")
+        print(f"[DEBUG] Distributed mode - Node rank: {node_rank}, Local rank: {local_rank}, Global rank: {rank}")
+    else:
+        rank = 0
+        device = "cpu"
+        print(f"[DEBUG] Single process: args_cli.logdir = '{args_cli.logdir}'")
+    
+    # In distributed mode, ensure all nodes use consistent paths
+    if args_cli.distributed:
+        # Get base log directory from environment variable or use default
+        checkpoint_logdir = os.environ.get('CHECKPOINT_LOGDIR')
+        if checkpoint_logdir:
+            log_root_path = os.path.abspath(checkpoint_logdir)
+            print(f"[INFO] Rank {rank}: Using distributed base log directory: {log_root_path}")
+        else:
+            log_root_path = os.path.join("/mnt/efs/checkpoints", "rsl_rl")
+            print(f"[WARNING] Rank {rank}: CHECKPOINT_LOGDIR not set. Using default: {log_root_path}")
+        
+        # Check if this is a resume job by looking for resume arguments
+        is_resume_job = agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation"
+        
+        if is_resume_job:
+            # RESUME MODE: Use the full timestamped checkpoint directory for consistent logging
+            # CHECKPOINT_LOGDIR is used for Isaac Lab checkpoint loading (experiment dir)
+            # CHECKPOINT_FULL_PATH is used for actual logging/videos (full timestamped path)
+            checkpoint_full_path = os.environ.get('CHECKPOINT_FULL_PATH')
+            if checkpoint_full_path:
+                log_dir = checkpoint_full_path
+                print(f"[INFO] Rank {rank}: Resume mode - using full timestamped log directory: {log_dir}")
+            else:
+                # Fallback to original behavior if CHECKPOINT_FULL_PATH not set
+                log_dir = log_root_path
+                print(f"[WARNING] Rank {rank}: CHECKPOINT_FULL_PATH not set, using base directory: {log_dir}")
+        else:
+            # NEW TRAINING MODE: Create new timestamped directory
+            # Use shared file approach to synchronize run_name across nodes
+            run_name_file = os.path.join(log_root_path, ".run_name_sync")
+            
+            if rank == 0:
+                # Rank 0 creates the timestamp and writes to shared file
+                run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                if agent_cfg.run_name:
+                    run_name += f"_{agent_cfg.run_name}"
+                print(f"[INFO] Rank 0: Generated run_name: {run_name}")
+                
+                # Ensure directory exists and write run_name to shared file
+                os.makedirs(log_root_path, exist_ok=True)
+                with open(run_name_file, 'w') as f:
+                    f.write(run_name)
+            else:
+                # Worker nodes wait for and read run_name from shared file
+                print(f"[INFO] Rank {rank}: Waiting for run_name from rank 0...")
+                import time
+                max_wait = 60  # seconds
+                wait_time = 0
+                while not os.path.exists(run_name_file) and wait_time < max_wait:
+                    time.sleep(1)
+                    wait_time += 1
+                
+                if os.path.exists(run_name_file):
+                    with open(run_name_file, 'r') as f:
+                        run_name = f.read().strip()
+                    print(f"[INFO] Rank {rank}: Using run_name from rank 0: {run_name}")
+                else:
+                    # Fallback if file doesn't exist
+                    run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                    print(f"[WARNING] Rank {rank}: Timeout waiting for run_name, using fallback: {run_name}")
+            
+            # Create the full log directory path for new training
+            if agent_cfg.experiment_name:
+                log_dir = os.path.join(log_root_path, agent_cfg.experiment_name, run_name)
+            else:
+                log_dir = os.path.join(log_root_path, run_name)
+    
+    else:
+        # Single process mode: use original logic
+        if args_cli.logdir:
+            log_root_path = os.path.abspath(args_cli.logdir)
             run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             if agent_cfg.run_name:
                 run_name += f"_{agent_cfg.run_name}"
+            
+            if agent_cfg.experiment_name:
+                log_dir = os.path.join(log_root_path, agent_cfg.experiment_name, run_name)
+            else:
+                log_dir = os.path.join(log_root_path, run_name)
         else:
-            run_name = ""
-        # broadcast the run name to all other ranks
-        if torch.distributed.is_initialized():
-            # Broadcast tensor must be on CPU to avoid race condition with CUDA initialization
-            run_name_tensor = torch.tensor(list(map(ord, run_name)), dtype=torch.int8, device="cpu")
-            torch.distributed.broadcast(run_name_tensor, src=0)
-            run_name_tensor = run_name_tensor.to(device)
-            run_name = "".join(map(chr, run_name_tensor.tolist()))
-        # create the full log directory path
-        if agent_cfg.experiment_name:
-            log_dir = os.path.join(log_root_path, agent_cfg.experiment_name, run_name)
-        else:
-            log_dir = os.path.join(log_root_path, run_name)
-    else:
-        # use default directory if no logdir is provided
-        log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
-        log_dir = os.path.join(log_root_path, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+            # Use default directory if no logdir is provided
+            log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
+            log_dir = os.path.join(log_root_path, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
 
     print(f"[INFO] Logging experiment in directory: {log_dir}")
+
+    # Save resume path before creating runner
+    if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+        # For distributed mode, we need log_root_path to be defined
+        if not args_cli.distributed:
+            if args_cli.logdir:
+                log_root_path = os.path.abspath(args_cli.logdir)
+            else:
+                log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
+        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     # clear CUDA cache to prevent memory fragmentation
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-    
+
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
@@ -170,14 +254,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
-    # save resume path before creating a new log_dir
-    if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-
     # wrap for video recording
     if args_cli.video:
         video_kwargs = {
-            "video_folder": os.path.join(log_dir, "videos", "train"),
+            "video_folder": os.path.join(log_dir, "videos"),
             "step_trigger": lambda step: step % args_cli.video_interval == 0,
             "video_length": args_cli.video_length,
             "disable_logger": True,
