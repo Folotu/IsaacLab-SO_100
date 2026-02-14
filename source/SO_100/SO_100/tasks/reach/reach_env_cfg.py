@@ -21,7 +21,6 @@ from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
-# import mdp
 import isaaclab_tasks.manager_based.manipulation.reach.mdp as mdp
 
 from SO_100.robots import SO_ARM100_CFG

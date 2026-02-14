@@ -25,7 +25,6 @@ from .so_100_robot_cfg import SO100_CFG  # isort: skip
 # Pre-defined configs
 ##
 from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
-# from .SO100 import SO100_CFG  # Corrected import # isort: skip
 
 
 @configclass

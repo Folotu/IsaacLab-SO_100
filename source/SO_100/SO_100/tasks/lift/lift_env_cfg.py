@@ -9,7 +9,7 @@ import os
 import math
 import torch
 import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg, DeformableObjectCfg, RigidObjectCfg, RigidObjectCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, DeformableObjectCfg, RigidObjectCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -19,26 +19,14 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors.frame_transformer.frame_transformer_cfg import FrameTransformerCfg
+from isaaclab.sensors import FrameTransformerCfg
+from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
+from isaaclab.sim.schemas.schemas_cfg import RigidBodyPropertiesCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg, UsdFileCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
-
-from isaaclab.assets import RigidObjectCfg
-from isaaclab.sensors import FrameTransformerCfg
-from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
-from isaaclab.sim.schemas.schemas_cfg import RigidBodyPropertiesCfg
-from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
-from isaaclab.utils import configclass
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-
 from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
-
-# from isaaclab.utils.offset import OffsetCfg
-# from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
-# from isaaclab.utils.visualizer import FRAME_MARKER_CFG
-# from isaaclab.utils.assets import RigidBodyPropertiesCfg
 
 
 from . import mdp as local_mdp
@@ -169,15 +157,6 @@ class RewardsCfg:
     # Main lifting reward - matches working reference configuration  
     lifting_object = RewTerm(func=mdp.object_is_lifted, params={"minimal_height": 0.025}, weight=15.0)
 
-    # Progressive lifting reward - encourages any upward movement (reduced weight to avoid spiky dominance)
-    # object_height_progress = RewTerm(func=local_mdp.object_height_progress, weight=2.0)
-
-    # # Gripper closure reward when near object
-    # gripper_close_to_object = RewTerm(func=local_mdp.gripper_close_to_object, weight=3.0)
-
-    # # Orientation reward - encourage proper gripper alignment
-    # gripper_orientation = RewTerm(func=local_mdp.gripper_orientation, weight=2.0)
-
     object_goal_tracking = RewTerm(
         func=mdp.object_goal_distance,
         params={"std": 0.3, "minimal_height": 0.04, "command_name": "object_pose"},
@@ -280,13 +259,10 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
                 f"[LiftEnvCfg] WORLD_SIZE={world_size} RANK={rank_env} TOTAL_ENVS={total_envs} "
                 f"PER_RANK_ENVs={per_rank_envs} SCENE.num_envs={self.scene.num_envs}")
 
-        self.sim.physx.bounce_threshold_velocity = 0.2
         self.sim.physx.bounce_threshold_velocity = 0.01
         self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
         self.sim.physx.gpu_total_aggregate_pairs_capacity = 16 * 1024
         self.sim.physx.friction_correlation_distance = 0.00625
-
-
 
 
 @configclass
@@ -375,8 +351,6 @@ class SoArm100CubeCubeLiftEnvCfg(LiftEnvCfg):
                 ),
             ],
         )
-
-
 
 
 @configclass
