@@ -19,7 +19,7 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import FrameTransformerCfg
+from isaaclab.sensors import FrameTransformerCfg, TiledCameraCfg
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
 from isaaclab.sim.schemas.schemas_cfg import RigidBodyPropertiesCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg, UsdFileCfg
@@ -52,6 +52,9 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
     ee_frame: FrameTransformerCfg = MISSING
     # target object: will be populated by agent env cfg
     object: RigidObjectCfg | DeformableObjectCfg = MISSING
+
+    # optional tiled camera sensor (set by camera-enabled env variants)
+    tiled_camera: TiledCameraCfg | None = None
 
     # Table
     table = AssetBaseCfg(
@@ -362,4 +365,68 @@ class SoArm100CubeCubeLiftEnvCfg_PLAY(SoArm100CubeCubeLiftEnvCfg):
         self.scene.num_envs = 50
         self.scene.env_spacing = 2.5
         # disable randomization for play
+        self.observations.policy.enable_corruption = False
+
+
+@configclass
+class SoArm100CubeLiftCameraEnvCfg(SoArm100CubeCubeLiftEnvCfg):
+    """Camera-enabled variant of the SO-100 cube lift environment.
+
+    Adds a TiledCamera sensor mounted on the robot's Fixed_Jaw link (wrist camera position).
+    Uses 15m env_spacing to prevent cross-environment visual contamination (camera far clip is 2.0m).
+    Observation pipeline is IDENTICAL to state-based variant; Phase 3 will swap in vision encoder.
+    """
+
+    def __post_init__(self):
+        # post init of parent (sets up robot, actions, scene, etc.)
+        super().__post_init__()
+
+        # Increase env spacing to prevent cross-env visual contamination
+        # SO-100 arm reach is ~0.3m, camera far clip is 2.0m, so 15m ensures complete isolation
+        self.scene.env_spacing = 15.0
+
+        # Camera mode uses fewer envs due to rendering memory overhead
+        try:
+            camera_total = int(os.getenv("CAMERA_NUM_ENVS") or os.getenv("TOTAL_ENVS") or os.getenv("NUM_ENVS") or 1024)
+        except Exception:
+            camera_total = 1024
+        try:
+            world_size = int(os.getenv("WORLD_SIZE") or 1)
+        except Exception:
+            world_size = 1
+        self.scene.num_envs = max(1, (camera_total + world_size - 1) // world_size)
+
+        # Mount TiledCamera on the Fixed_Jaw link (gripper body where a real wrist camera mounts)
+        # URDF hierarchy: Base -> Rotation_Pitch -> Upper_Arm -> Lower_Arm -> Wrist_Pitch_Roll -> Fixed_Jaw -> Moving_Jaw
+        self.scene.tiled_camera = TiledCameraCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/Fixed_Jaw/wrist_cam",
+            update_period=0.0,  # update every render step
+            height=84,
+            width=84,
+            data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=2.12,
+                focus_distance=0.5,
+                horizontal_aperture=3.6,
+                clipping_range=(0.01, 2.0),  # far=2.0m ensures 15m-spaced neighbors are invisible
+            ),
+            offset=TiledCameraCfg.OffsetCfg(
+                pos=(0.0, -0.05, 0.0),
+                rot=(0.5, -0.5, 0.5, -0.5),
+                convention="ros",
+            ),
+        )
+
+
+@configclass
+class SoArm100CubeLiftCameraEnvCfg_PLAY(SoArm100CubeLiftCameraEnvCfg):
+    """Play/evaluation variant of the camera-enabled SO-100 cube lift environment."""
+
+    def __post_init__(self):
+        # post init of parent (sets up camera, spacing, etc.)
+        super().__post_init__()
+        # Smaller scene for play/evaluation
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 15.0  # maintain camera spacing even in play mode
+        # Disable observation corruption for evaluation
         self.observations.policy.enable_corruption = False
