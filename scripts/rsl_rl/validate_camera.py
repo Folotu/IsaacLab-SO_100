@@ -281,7 +281,15 @@ def run_normal_validation():
         _print_memory("Before env creation")
 
     # create environment
-    env = gym.make(args_cli.task, cfg=None, render_mode=None)
+    env_cfg = gym.spec(args_cli.task).kwargs["env_cfg_entry_point"]
+    # Resolve the entry point string to the actual config class
+    import importlib
+    module_path, class_name = env_cfg.rsplit(":", 1)
+    module = importlib.import_module(module_path)
+    env_cfg_cls = getattr(module, class_name)
+    env_cfg = env_cfg_cls()
+    env_cfg.scene.num_envs = args_cli.num_envs
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
 
     print(f"[INFO] Created environment: {args_cli.task}")
     print(f"[INFO] Number of environments: {env.unwrapped.num_envs}")

@@ -396,10 +396,15 @@ class SoArm100CubeLiftCameraEnvCfg(SoArm100CubeCubeLiftEnvCfg):
             world_size = 1
         self.scene.num_envs = max(1, (camera_total + world_size - 1) // world_size)
 
-        # Mount TiledCamera on the Fixed_Jaw link (gripper body where a real wrist camera mounts)
-        # URDF hierarchy: Base -> Rotation_Pitch -> Upper_Arm -> Lower_Arm -> Wrist_Pitch_Roll -> Fixed_Jaw -> Moving_Jaw
+        # Disable debug visualizers -- they show up in camera images and would confuse the vision encoder
+        # (frame markers, command pose arrows, cube markers are not present on the real robot)
+        self.commands.object_pose.debug_vis = False
+        self.scene.ee_frame.debug_vis = False
+        self.scene.cube_marker.debug_vis = False
+
+        # Mount TiledCamera on the Fixed_Gripper link (gripper body where a real wrist camera mounts)
         self.scene.tiled_camera = TiledCameraCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/Fixed_Jaw/wrist_cam",
+            prim_path="{ENV_REGEX_NS}/Robot/Fixed_Gripper/wrist_cam",
             update_period=0.0,  # update every render step
             height=84,
             width=84,
@@ -411,9 +416,9 @@ class SoArm100CubeLiftCameraEnvCfg(SoArm100CubeCubeLiftEnvCfg):
                 clipping_range=(0.01, 2.0),  # far=2.0m ensures 15m-spaced neighbors are invisible
             ),
             offset=TiledCameraCfg.OffsetCfg(
-                pos=(0.0, -0.05, 0.0),
-                rot=(0.5, -0.5, 0.5, -0.5),
-                convention="ros",
+                pos=(0.0074, -0.05101, 0.00263),  # tuned in Isaac Sim GUI to match real SO-100 wrist camera
+                rot=(0.1132, 0.9936, 0.0, 0.0),  # Euler X=167deg - forward-looking, matching real camera view
+                convention="opengl",
             ),
         )
 
