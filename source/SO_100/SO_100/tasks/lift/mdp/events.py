@@ -52,7 +52,9 @@ def randomize_object_color(
     import omni.replicator.core as rep
 
     asset = env.scene[asset_cfg.name]
-    mesh_prim_path = f"{asset.cfg.prim_path}/.*"
+    # Target only visual meshes, NOT collision meshes -- Replicator deletes/recreates prims
+    # which invalidates physics tensor views if collision prims are touched
+    mesh_prim_path = f"{asset.cfg.prim_path}/.*/visuals"
 
     # Sample random color
     r = random.uniform(colors["r"][0], colors["r"][1])
