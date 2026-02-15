@@ -134,6 +134,43 @@ class ObservationsCfg:
 
 
 @configclass
+class CameraObservationsCfg:
+    """Observation specifications for camera-based MDP.
+
+    Replaces ground-truth object_position with visual features from a frozen
+    ResNet18 encoder. The encoder runs inside Isaac Lab's image_features
+    observation term -- weights are frozen (no gradient), output is 1000-dim
+    ImageNet logits concatenated with proprioceptive state.
+
+    Total obs dim: joint_pos(6) + joint_vel(6) + visual_features(1000) + target(7) + action(6) = 1025
+    """
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+        """Observations for policy group with visual features."""
+
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        visual_features = ObsTerm(
+            func=mdp.image_features,
+            params={
+                "sensor_cfg": SceneEntityCfg("tiled_camera"),
+                "data_type": "rgb",
+                "model_name": "resnet18",
+            },
+        )
+        target_object_position = ObsTerm(func=mdp.generated_commands, params={"command_name": "object_pose"})
+        actions = ObsTerm(func=mdp.last_action)
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    # observation groups
+    policy: PolicyCfg = PolicyCfg()
+
+
+@configclass
 class EventCfg:
     """Configuration for events."""
 
@@ -401,6 +438,10 @@ class SoArm100CubeLiftCameraEnvCfg(SoArm100CubeCubeLiftEnvCfg):
         self.commands.object_pose.debug_vis = False
         self.scene.ee_frame.debug_vis = False
         self.scene.cube_marker.debug_vis = False
+
+        # Swap observation pipeline: replace ground-truth object position with visual features
+        # from frozen ResNet18 encoder (Phase 3 vision encoder integration)
+        self.observations = CameraObservationsCfg()
 
         # Mount TiledCamera on the Fixed_Gripper link (gripper body where a real wrist camera mounts)
         self.scene.tiled_camera = TiledCameraCfg(
