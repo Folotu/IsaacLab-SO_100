@@ -84,7 +84,7 @@ def main():
 
     # --- Step 2: Wrap with RslRlVecEnvWrapper (same as train.py) ---
     print("\n[2/6] Wrapping with RslRlVecEnvWrapper...")
-    env = RslRlVecEnvWrapper(env, clip_actions=True)
+    env = RslRlVecEnvWrapper(env, clip_actions=1.0)
     print(f"  num_obs: {env.num_obs}")
     print(f"  num_actions: {env.num_actions}")
 
