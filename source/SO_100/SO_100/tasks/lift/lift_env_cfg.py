@@ -24,7 +24,7 @@ from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
 from isaaclab.sim.schemas.schemas_cfg import RigidBodyPropertiesCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg, UsdFileCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, NVIDIA_NUCLEUS_DIR
 
 from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
 
@@ -183,6 +183,53 @@ class EventCfg:
             "pose_range": {"x": (-0.1, 0.1), "y": (-0.2, 0.2), "z": (0.0, 0.0)},
             "velocity_range": {},
             "asset_cfg": SceneEntityCfg("object", body_names="Object"),
+        },
+    )
+
+
+@configclass
+class CameraEventCfg(EventCfg):
+    """Event configuration with visual domain randomization for camera-based training.
+
+    Extends the base EventCfg with visual randomization events that fire on episode reset.
+    These randomizations force the frozen ResNet18 encoder to learn appearance-invariant
+    features for sim-to-real transfer. Only used with camera-based env variants.
+
+    Requires replicate_physics=False on the scene config for Replicator API access.
+    """
+
+    # Randomize cube object color each episode (full RGB range)
+    # Uses local plain function (not ManagerTermBase) for reliable mode="reset" in RL envs
+    randomize_object_color = EventTerm(
+        func=local_mdp.randomize_object_color,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("object"),
+            "colors": {"r": (0.0, 1.0), "g": (0.0, 1.0), "b": (0.0, 1.0)},
+            "event_name": "object_color_randomizer",
+        },
+    )
+
+    # Randomize table texture each episode using NVIDIA Nucleus wood/stone textures
+    # Uses local plain function (not ManagerTermBase) for reliable mode="reset" in RL envs
+    randomize_table_texture = EventTerm(
+        func=local_mdp.randomize_table_texture,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("table"),
+            "textures": [
+                f"{NVIDIA_NUCLEUS_DIR}/Materials/Base/Wood/Ash/Ash_BaseColor.png",
+                f"{NVIDIA_NUCLEUS_DIR}/Materials/Base/Wood/Bamboo_Planks/Bamboo_Planks_BaseColor.png",
+                f"{NVIDIA_NUCLEUS_DIR}/Materials/Base/Wood/Birch/Birch_BaseColor.png",
+                f"{NVIDIA_NUCLEUS_DIR}/Materials/Base/Wood/Cherry/Cherry_BaseColor.png",
+                f"{NVIDIA_NUCLEUS_DIR}/Materials/Base/Wood/Oak/Oak_BaseColor.png",
+                f"{NVIDIA_NUCLEUS_DIR}/Materials/Base/Wood/Timber/Timber_BaseColor.png",
+                f"{NVIDIA_NUCLEUS_DIR}/Materials/Base/Wood/Walnut_Planks/Walnut_Planks_BaseColor.png",
+                f"{NVIDIA_NUCLEUS_DIR}/Materials/Base/Stone/Marble/Marble_BaseColor.png",
+                f"{NVIDIA_NUCLEUS_DIR}/Materials/Base/Metals/Steel_Stainless/Steel_Stainless_BaseColor.png",
+            ],
+            "event_name": "table_texture_randomizer",
+            "texture_rotation": (0.0, math.pi),
         },
     )
 
@@ -439,6 +486,12 @@ class SoArm100CubeLiftCameraEnvCfg(SoArm100CubeCubeLiftEnvCfg):
         self.scene.ee_frame.debug_vis = False
         self.scene.cube_marker.debug_vis = False
 
+        # Disable scene replication -- required for visual domain randomization (Replicator API)
+        self.scene.replicate_physics = False
+
+        # Swap in camera-specific events with visual domain randomization
+        self.events = CameraEventCfg()
+
         # Swap observation pipeline: replace ground-truth object position with visual features
         # from frozen ResNet18 encoder (Phase 3 vision encoder integration)
         self.observations = CameraObservationsCfg()
@@ -474,5 +527,7 @@ class SoArm100CubeLiftCameraEnvCfg_PLAY(SoArm100CubeLiftCameraEnvCfg):
         # Smaller scene for play/evaluation
         self.scene.num_envs = 50
         self.scene.env_spacing = 15.0  # maintain camera spacing even in play mode
+        # Disable randomization for play/evaluation -- want consistent visuals for comparison
+        self.events = EventCfg()
         # Disable observation corruption for evaluation
         self.observations.policy.enable_corruption = False
