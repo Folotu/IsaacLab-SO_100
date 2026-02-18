@@ -235,6 +235,33 @@ class CameraEventCfg(EventCfg):
 
 
 @configclass
+class KorniaAugmentEventCfg(EventCfg):
+    """Event configuration with GPU tensor-level visual augmentation via Kornia.
+
+    Extends the base EventCfg with a Kornia ColorJitter augmentation that fires
+    every simulation step via mode="interval". The augmentation modifies the camera
+    tensor buffer in-place BEFORE the observation manager reads it, so
+    mdp.image_features sees augmented images without any change to obs dimensions.
+
+    Unlike CameraEventCfg (Replicator-based), this does NOT require
+    replicate_physics=False and runs in O(1) regardless of environment count.
+    """
+
+    apply_kornia_augmentation = EventTerm(
+        func=local_mdp.apply_kornia_augmentation,
+        mode="interval",
+        interval_range_s=(0.0, 0.0),
+        params={
+            "sensor_cfg_name": "tiled_camera",
+            "brightness": 0.2,
+            "contrast": 0.2,
+            "saturation": 0.2,
+            "hue": 0.1,
+        },
+    )
+
+
+@configclass
 class RewardsCfg:
     """Reward terms for the MDP."""
 
@@ -486,8 +513,10 @@ class SoArm100CubeLiftCameraEnvCfg(SoArm100CubeCubeLiftEnvCfg):
         self.scene.ee_frame.debug_vis = False
         self.scene.cube_marker.debug_vis = False
 
-        # Keep replicate_physics=True for performance (domain randomization is now
-        # tensor-based via Kornia in augmented_image_features, not Replicator USD-level)
+        # Keep replicate_physics=True -- Kornia augmentation operates on GPU tensors,
+        # not USD prims, so no Replicator API dependency
+        # Swap in Kornia-based augmentation events (fires every step via interval mode)
+        self.events = KorniaAugmentEventCfg()
 
         # Swap observation pipeline: replace ground-truth object position with visual features
         # from frozen ResNet18 encoder (Phase 3 vision encoder integration)

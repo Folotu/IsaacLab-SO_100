@@ -117,3 +117,66 @@ def randomize_table_texture(
             project_uvw=True,
             texture_rotate=rep.distribution.uniform(*rotation_deg),
         )
+
+
+def apply_kornia_augmentation(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    sensor_cfg_name: str = "tiled_camera",
+    brightness: float = 0.2,
+    contrast: float = 0.2,
+    saturation: float = 0.2,
+    hue: float = 0.1,
+):
+    """Apply Kornia color jitter augmentation to camera tensor buffer in-place.
+
+    Modifies env.scene[sensor_cfg_name].data.output["rgb"] BEFORE the observation
+    manager reads it, so mdp.image_features sees augmented images without any
+    change to the observation pipeline or obs dimensions.
+
+    This is called as an EventTerm with mode="interval" (fires every step).
+    The Isaac Lab env step order is: interval events -> observation compute,
+    so the augmented buffer is ready when image_features reads it.
+
+    Uses same_on_batch=False so each environment gets unique augmentation.
+    Operates entirely on GPU tensors -- no USD/Replicator dependency.
+
+    Args:
+        env: The environment instance.
+        env_ids: The environment indices (used by interval mode, but we augment all envs).
+        sensor_cfg_name: Name of the camera sensor in the scene. Defaults to "tiled_camera".
+        brightness: ColorJitter brightness range. Defaults to 0.2.
+        contrast: ColorJitter contrast range. Defaults to 0.2.
+        saturation: ColorJitter saturation range. Defaults to 0.2.
+        hue: ColorJitter hue range. Defaults to 0.1.
+    """
+    # Lazy-init the Kornia pipeline on first call (avoids import at module level
+    # which would fail on machines without kornia installed)
+    if not hasattr(env, "_kornia_augment_pipeline"):
+        import kornia.augmentation as K
+        env._kornia_augment_pipeline = K.ColorJitter(
+            brightness=brightness,
+            contrast=contrast,
+            saturation=saturation,
+            hue=hue,
+            p=1.0,
+            same_on_batch=False,
+        )
+
+    camera = env.scene[sensor_cfg_name]
+    raw_rgba = camera.data.output.get("rgb")
+    if raw_rgba is None:
+        return
+
+    # raw_rgba shape: (num_envs, H, W, 4) uint8 RGBA
+    # Extract RGB, convert to float NCHW for Kornia
+    rgb_nhwc = raw_rgba[:, :, :, :3]  # (N, H, W, 3)
+    rgb_nchw = rgb_nhwc.permute(0, 3, 1, 2).float() / 255.0  # (N, 3, H, W) float [0,1]
+
+    with torch.no_grad():
+        augmented_nchw = env._kornia_augment_pipeline(rgb_nchw)  # (N, 3, H, W)
+
+    # Convert back to uint8 NHWC and reconstruct RGBA
+    aug_nhwc = (augmented_nchw.permute(0, 2, 3, 1).clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+    # Write back into the camera buffer -- alpha channel stays 255
+    raw_rgba[:, :, :, :3] = aug_nhwc
