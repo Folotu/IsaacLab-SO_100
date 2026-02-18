@@ -152,11 +152,12 @@ class CameraObservationsCfg:
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
         visual_features = ObsTerm(
-            func=mdp.image_features,
+            func=local_mdp.augmented_image_features,
             params={
                 "sensor_cfg": SceneEntityCfg("tiled_camera"),
                 "data_type": "rgb",
                 "model_name": "resnet18",
+                "augment": True,
             },
         )
         target_object_position = ObsTerm(func=mdp.generated_commands, params={"command_name": "object_pose"})
@@ -486,11 +487,8 @@ class SoArm100CubeLiftCameraEnvCfg(SoArm100CubeCubeLiftEnvCfg):
         self.scene.ee_frame.debug_vis = False
         self.scene.cube_marker.debug_vis = False
 
-        # Disable scene replication -- required for visual domain randomization (Replicator API)
-        self.scene.replicate_physics = False
-
-        # Swap in camera-specific events with visual domain randomization
-        self.events = CameraEventCfg()
+        # Keep replicate_physics=True for performance (domain randomization is now
+        # tensor-based via Kornia in augmented_image_features, not Replicator USD-level)
 
         # Swap observation pipeline: replace ground-truth object position with visual features
         # from frozen ResNet18 encoder (Phase 3 vision encoder integration)
