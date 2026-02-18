@@ -152,12 +152,11 @@ class CameraObservationsCfg:
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
         visual_features = ObsTerm(
-            func=local_mdp.augmented_image_features,
+            func=mdp.image_features,
             params={
                 "sensor_cfg": SceneEntityCfg("tiled_camera"),
                 "data_type": "rgb",
                 "model_name": "resnet18",
-                "augment": True,
             },
         )
         target_object_position = ObsTerm(func=mdp.generated_commands, params={"command_name": "object_pose"})
