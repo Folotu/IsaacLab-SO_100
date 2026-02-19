@@ -372,6 +372,62 @@ class CurriculumCfg:
     )
 
 
+@configclass
+class CameraRewardsCfg:
+    """Reward terms for camera-based MDP.
+
+    Boosted positive rewards (5x reaching, 3x lifting) to overcome the slower
+    learning signal from visual observations. Reduced action penalties to prevent
+    the "survival of the stillest" collapse seen with the original RewardsCfg.
+    """
+
+    # Dense reaching reward -- boosted 5x for camera policy (visual features are noisier)
+    reaching_object = RewTerm(func=mdp.object_ee_distance, params={"std": 0.1}, weight=5.0)
+
+    # Main lifting reward -- boosted 3x to create stronger gradient for manipulation
+    lifting_object = RewTerm(func=mdp.object_is_lifted, params={"minimal_height": 0.025}, weight=50.0)
+
+    object_goal_tracking = RewTerm(
+        func=mdp.object_goal_distance,
+        params={"std": 0.3, "minimal_height": 0.04, "command_name": "object_pose"},
+        weight=16.0,
+    )
+
+    object_goal_tracking_fine_grained = RewTerm(
+        func=mdp.object_goal_distance,
+        params={"std": 0.05, "minimal_height": 0.04, "command_name": "object_pose"},
+        weight=5.0,
+    )
+
+    # Action penalties -- 10x smaller starting weight for camera training
+    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
+    joint_vel = RewTerm(
+        func=mdp.joint_vel_l2,
+        weight=-1e-4,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+
+
+@configclass
+class CameraCurriculumCfg:
+    """Curriculum terms for camera-based MDP.
+
+    Much slower penalty ramp (1M steps vs 10K) and smaller final penalty (-0.01 vs -0.1).
+    Camera-based policies need 1000+ iterations to learn manipulation, so penalties
+    must not overwhelm exploration before the agent finds the reward signal.
+    """
+
+    action_rate = CurrTerm(
+        func=mdp.modify_reward_weight,
+        params={"term_name": "action_rate", "weight": -1e-2, "num_steps": 1000000}
+    )
+
+    joint_vel = CurrTerm(
+        func=mdp.modify_reward_weight,
+        params={"term_name": "joint_vel", "weight": -1e-2, "num_steps": 1000000}
+    )
+
+
 ##
 # Environment configuration
 ##
@@ -574,9 +630,12 @@ class SoArm100CubeLiftCameraEnvCfg(SoArm100CubeCubeLiftEnvCfg):
         self.scene.ee_frame.debug_vis = False
         self.scene.cube_marker.debug_vis = False
 
-        # Keep replicate_physics=True -- Kornia augmentation operates on GPU tensors,
-        # not USD prims, so no Replicator API dependency
-        # Swap in Kornia-based augmentation events (fires every step via interval mode)
+        # Camera-specific rewards: boosted positive signals, gentler penalties
+        self.rewards = CameraRewardsCfg()
+        # Camera-specific curriculum: 100x slower penalty ramp, 10x smaller final penalty
+        self.curriculum = CameraCurriculumCfg()
+
+        # Kornia-based augmentation events (fires every step via interval mode)
         self.events = KorniaAugmentEventCfg()
 
         # Asymmetric actor-critic observations:
