@@ -40,11 +40,21 @@ class LiftCubePPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 @configclass
 class LiftCubeCameraPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    """PPO runner config for camera-based SO-100 cube lift.
+    """PPO runner config for camera-based SO-100 cube lift with asymmetric actor-critic.
 
-    Wider hidden layers than state-based variant to handle 1025-dim observations
-    (6 joint_pos + 6 joint_vel + 1000 ResNet18 features + 7 target + 6 actions).
-    RSL-RL reads num_obs dynamically from env, so no explicit obs dim config needed.
+    Asymmetric observation spaces:
+    - Actor obs: 537-dim (joint_pos(6) + joint_vel(6) + visual_features(512) + target(7) + action(6))
+    - Critic obs: 28-dim (joint_pos(6) + joint_vel(6) + object_position(3) + target(7) + action(6))
+
+    The critic receives privileged ground-truth object position (matching the state-based
+    policy exactly), while the actor learns from 512-dim penultimate ResNet18 features.
+
+    Actor hidden dims [512, 256, 128] handle the 537-dim visual input.
+    Critic hidden dims [256, 128, 64] match the state-based LiftCubePPORunnerCfg
+    (28-dim input is the same dimensionality as the state-based policy).
+
+    RSL-RL reads num_obs and num_privileged_obs dynamically from the env wrapper.
+    The RslRlVecEnvWrapper sets num_privileged_obs from the "critic" observation group.
     """
     num_steps_per_env = 24
     max_iterations = 1500
@@ -54,7 +64,7 @@ class LiftCubeCameraPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         actor_hidden_dims=[512, 256, 128],
-        critic_hidden_dims=[512, 256, 128],
+        critic_hidden_dims=[256, 128, 64],
         activation="elu",
         noise_std_type="log",
     )
