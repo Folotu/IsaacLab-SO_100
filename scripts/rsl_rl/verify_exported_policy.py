@@ -35,6 +35,7 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 import torchvision.transforms as T
+from torchvision.models.feature_extraction import create_feature_extractor
 
 
 # ===========================================================================
@@ -44,8 +45,9 @@ import torchvision.transforms as T
 class CameraPolicy(nn.Module):
     """Standalone camera-based policy for SO-ARM-100 deployment.
 
-    Combines a frozen ResNet18 vision encoder with a trained MLP actor.
-    Takes raw camera image + proprioceptive state, outputs joint actions.
+    Combines a frozen ResNet18 penultimate-layer encoder (512-dim avgpool
+    features) with a trained MLP actor. Takes raw camera image +
+    proprioceptive state, outputs joint actions.
 
     Input:
         image: (B, H, W, 3) uint8 tensor -- raw camera image (any resolution)
@@ -57,12 +59,15 @@ class CameraPolicy(nn.Module):
         actions: (B, 6) float32 tensor -- joint position targets
 
     The observation concatenation order matches the training pipeline:
-        joint_pos(6) + joint_vel(6) + visual_features(1000) + target_pose(7) + last_action(6) = 1025
+        joint_pos(6) + joint_vel(6) + visual_features(512) + target_pose(7) + last_action(6) = 537
+
+    Encoder output: 512-dim penultimate features (avgpool, before FC layer).
+    Uses create_feature_extractor to extract the 'flatten' node output.
     """
 
-    ENCODER_OUTPUT_DIM = 1000
+    ENCODER_OUTPUT_DIM = 512
     ACTOR_HIDDEN_DIMS = [512, 256, 128]
-    OBS_DIM = 1025
+    OBS_DIM = 537
     ACTION_DIM = 6
     PROPRIO_DIM = 25
 
@@ -72,12 +77,13 @@ class CameraPolicy(nn.Module):
     def __init__(self) -> None:
         super().__init__()
 
-        # Frozen ResNet18 encoder (full model including FC -> 1000-dim output)
+        # Frozen ResNet18 encoder -- penultimate layer (512-dim avgpool output)
+        # Uses create_feature_extractor to get the 'flatten' node output.
         resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        resnet.eval()
-        for param in resnet.parameters():
+        self.encoder = create_feature_extractor(resnet, return_nodes={"flatten": "features"})
+        self.encoder.eval()
+        for param in self.encoder.parameters():
             param.requires_grad = False
-        self.encoder = resnet
 
         # ImageNet normalization
         self.normalize = T.Normalize(
@@ -92,7 +98,7 @@ class CameraPolicy(nn.Module):
             antialias=True,
         )
 
-        # MLP actor: [1025 -> 512 -> 256 -> 128 -> 6] with ELU
+        # MLP actor: [537 -> 512 -> 256 -> 128 -> 6] with ELU
         self.actor = nn.Sequential(
             nn.Linear(self.OBS_DIM, self.ACTOR_HIDDEN_DIMS[0]),
             nn.ELU(),
@@ -121,11 +127,12 @@ class CameraPolicy(nn.Module):
         return image
 
     def forward(self, image: torch.Tensor, proprio: torch.Tensor) -> torch.Tensor:
-        """Run inference: image -> ResNet18 -> concat with proprio -> MLP -> actions."""
+        """Run inference: image -> ResNet18 penultimate -> concat with proprio -> MLP -> actions."""
         processed_image = self._preprocess_image(image)
 
         with torch.no_grad():
-            visual_features = self.encoder(processed_image)
+            encoder_output = self.encoder(processed_image)
+            visual_features = encoder_output["features"]  # (B, 512)
 
         joint_pos = proprio[:, :6]
         joint_vel = proprio[:, 6:12]
