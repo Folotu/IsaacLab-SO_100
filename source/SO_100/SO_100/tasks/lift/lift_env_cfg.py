@@ -171,6 +171,60 @@ class CameraObservationsCfg:
 
 
 @configclass
+class AsymmetricCameraObsCfg:
+    """Asymmetric actor-critic observations for camera-based training.
+
+    Actor (policy group): Uses 512-dim penultimate ResNet18 visual features + proprioceptive state.
+    Critic (critic group): Uses privileged ground-truth object position + proprioceptive state.
+
+    The Isaac Lab RslRlVecEnvWrapper detects the "critic" observation group and
+    passes it as privileged observations to RSL-RL. RSL-RL's ActorCritic then
+    uses separate networks for actor (policy obs) and critic (privileged obs).
+
+    Actor obs dim: joint_pos(6) + joint_vel(6) + visual_features(512) + target(7) + action(6) = 537
+    Critic obs dim: joint_pos(6) + joint_vel(6) + object_position(3) + target(7) + action(6) = 28
+    """
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+        """Actor observations with 512-dim penultimate ResNet18 visual features."""
+
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        visual_features = ObsTerm(
+            func=local_mdp.penultimate_image_features,
+            params={
+                "sensor_cfg": SceneEntityCfg("tiled_camera"),
+                "data_type": "rgb",
+            },
+        )
+        target_object_position = ObsTerm(func=mdp.generated_commands, params={"command_name": "object_pose"})
+        actions = ObsTerm(func=mdp.last_action)
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    @configclass
+    class CriticCfg(ObsGroup):
+        """Critic observations with privileged ground-truth object position."""
+
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        object_position = ObsTerm(func=local_mdp.object_position_in_robot_root_frame)
+        target_object_position = ObsTerm(func=mdp.generated_commands, params={"command_name": "object_pose"})
+        actions = ObsTerm(func=mdp.last_action)
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    # observation groups
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
+
+
+@configclass
 class EventCfg:
     """Configuration for events."""
 
@@ -483,9 +537,16 @@ class SoArm100CubeCubeLiftEnvCfg_PLAY(SoArm100CubeCubeLiftEnvCfg):
 class SoArm100CubeLiftCameraEnvCfg(SoArm100CubeCubeLiftEnvCfg):
     """Camera-enabled variant of the SO-100 cube lift environment.
 
-    Adds a TiledCamera sensor mounted on the robot's Fixed_Jaw link (wrist camera position).
+    Adds a TiledCamera sensor mounted on the robot's Fixed_Gripper link (wrist camera position).
     Uses 15m env_spacing to prevent cross-environment visual contamination (camera far clip is 2.0m).
-    Observation pipeline is IDENTICAL to state-based variant; Phase 3 will swap in vision encoder.
+
+    Uses asymmetric actor-critic observations:
+    - Actor (policy): 512-dim penultimate ResNet18 features + proprioception (537-dim total)
+    - Critic: privileged ground-truth object position + proprioception (28-dim total)
+
+    The RslRlVecEnvWrapper detects the "critic" observation group and passes it as
+    privileged observations to RSL-RL, enabling the critic to learn from ground-truth
+    while the actor learns from camera features only.
     """
 
     def __post_init__(self):
@@ -518,9 +579,10 @@ class SoArm100CubeLiftCameraEnvCfg(SoArm100CubeCubeLiftEnvCfg):
         # Swap in Kornia-based augmentation events (fires every step via interval mode)
         self.events = KorniaAugmentEventCfg()
 
-        # Swap observation pipeline: replace ground-truth object position with visual features
-        # from frozen ResNet18 encoder (Phase 3 vision encoder integration)
-        self.observations = CameraObservationsCfg()
+        # Asymmetric actor-critic observations:
+        # - Policy group: 512-dim penultimate ResNet18 features + proprioception (actor)
+        # - Critic group: ground-truth object position + proprioception (privileged)
+        self.observations = AsymmetricCameraObsCfg()
 
         # Mount TiledCamera on the Fixed_Gripper link (gripper body where a real wrist camera mounts)
         self.scene.tiled_camera = TiledCameraCfg(
