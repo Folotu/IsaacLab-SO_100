@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """Export camera-based policy for standalone deployment.
 
-Combines a frozen ResNet18 vision encoder with the trained RSL-RL MLP actor
-into a single PyTorch model that can run inference using ONLY torch and
-torchvision -- no Isaac Lab, Isaac Sim, or RSL-RL required.
+Combines a frozen ResNet18 vision encoder (penultimate 512-dim features) with
+the trained RSL-RL MLP actor into a single PyTorch model that can run inference
+using ONLY torch and torchvision -- no Isaac Lab, Isaac Sim, or RSL-RL required.
 
 The RSL-RL checkpoint (model_N.pt) only stores the MLP actor-critic weights.
 During training, the ResNet18 encoder runs inside Isaac Lab's observation
-pipeline (mdp.image_features). At deployment on a real robot, there is no
-Isaac Lab, so this script creates a single model that:
+pipeline (mdp.image_features with create_feature_extractor). At deployment on
+a real robot, there is no Isaac Lab, so this script creates a single model that:
 
   1. Takes raw RGB image (H, W, 3) uint8 + proprioceptive state (25-dim)
-  2. Runs ResNet18 to produce 1000-dim features
-  3. Concatenates: joint_pos(6) + joint_vel(6) + visual_features(1000) + target(7) + last_action(6) = 1025
+  2. Runs ResNet18 penultimate layer (avgpool) to produce 512-dim features
+  3. Concatenates: joint_pos(6) + joint_vel(6) + visual_features(512) + target(7) + last_action(6) = 537
   4. Runs the trained MLP actor to produce 6-dim joint actions
 
 Usage:
@@ -38,13 +38,15 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 import torchvision.transforms as T
+from torchvision.models.feature_extraction import create_feature_extractor
 
 
 class CameraPolicy(nn.Module):
     """Standalone camera-based policy for SO-ARM-100 deployment.
 
-    Combines a frozen ResNet18 vision encoder with a trained MLP actor.
-    Takes raw camera image + proprioceptive state, outputs joint actions.
+    Combines a frozen ResNet18 penultimate-layer encoder (512-dim avgpool
+    features) with a trained MLP actor. Takes raw camera image +
+    proprioceptive state, outputs joint actions.
 
     Input:
         image: (B, H, W, 3) uint8 tensor -- raw camera image (any resolution)
@@ -56,13 +58,16 @@ class CameraPolicy(nn.Module):
         actions: (B, 6) float32 tensor -- joint position targets
 
     The observation concatenation order matches the training pipeline:
-        joint_pos(6) + joint_vel(6) + visual_features(1000) + target_pose(7) + last_action(6) = 1025
+        joint_pos(6) + joint_vel(6) + visual_features(512) + target_pose(7) + last_action(6) = 537
+
+    Encoder output: 512-dim penultimate features (avgpool, before FC layer).
+    Uses create_feature_extractor to extract the 'flatten' node output.
     """
 
     # Architecture constants matching the training configuration
-    ENCODER_OUTPUT_DIM = 1000  # ResNet18 FC output (ImageNet logits)
+    ENCODER_OUTPUT_DIM = 512  # ResNet18 penultimate layer (avgpool, before FC)
     ACTOR_HIDDEN_DIMS = [512, 256, 128]
-    OBS_DIM = 1025  # 6 + 6 + 1000 + 7 + 6
+    OBS_DIM = 537  # 6 + 6 + 512 + 7 + 6
     ACTION_DIM = 6
     PROPRIO_DIM = 25  # 6 + 6 + 7 + 6
 
@@ -73,13 +78,15 @@ class CameraPolicy(nn.Module):
     def __init__(self) -> None:
         super().__init__()
 
-        # Frozen ResNet18 encoder -- full model including FC layer (1000-dim output)
-        # This matches Isaac Lab's mdp.image_features which runs the complete resnet18
+        # Frozen ResNet18 encoder -- penultimate layer (512-dim avgpool output)
+        # Uses create_feature_extractor to get the 'flatten' node, which is the
+        # output of avgpool flattened to (B, 512), BEFORE the FC classification layer.
+        # This matches Isaac Lab's mdp.image_features with create_feature_extractor.
         resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        resnet.eval()
-        for param in resnet.parameters():
+        self.encoder = create_feature_extractor(resnet, return_nodes={"flatten": "features"})
+        self.encoder.eval()
+        for param in self.encoder.parameters():
             param.requires_grad = False
-        self.encoder = resnet
 
         # ImageNet normalization transform
         self.normalize = T.Normalize(
@@ -97,7 +104,7 @@ class CameraPolicy(nn.Module):
         # MLP actor matching RSL-RL architecture: [512, 256, 128] with ELU
         # Layer indices: 0=Linear, 1=ELU, 2=Linear, 3=ELU, 4=Linear, 5=ELU, 6=Linear
         self.actor = nn.Sequential(
-            nn.Linear(self.OBS_DIM, self.ACTOR_HIDDEN_DIMS[0]),   # 0: 1025 -> 512
+            nn.Linear(self.OBS_DIM, self.ACTOR_HIDDEN_DIMS[0]),   # 0: 537 -> 512
             nn.ELU(),                                              # 1
             nn.Linear(self.ACTOR_HIDDEN_DIMS[0], self.ACTOR_HIDDEN_DIMS[1]),  # 2: 512 -> 256
             nn.ELU(),                                              # 3
@@ -148,12 +155,13 @@ class CameraPolicy(nn.Module):
         # Step 1: Preprocess image to (B, 3, 224, 224) normalized float
         processed_image = self._preprocess_image(image)
 
-        # Step 2: Run frozen ResNet18 encoder -> (B, 1000) features
+        # Step 2: Run frozen ResNet18 penultimate encoder -> (B, 512) features
         with torch.no_grad():
-            visual_features = self.encoder(processed_image)
+            encoder_output = self.encoder(processed_image)
+            visual_features = encoder_output["features"]  # (B, 512)
 
         # Step 3: Concatenate in training observation order
-        # joint_pos(6) + joint_vel(6) + visual_features(1000) + target_pose(7) + last_action(6) = 1025
+        # joint_pos(6) + joint_vel(6) + visual_features(512) + target_pose(7) + last_action(6) = 537
         joint_pos = proprio[:, :6]
         joint_vel = proprio[:, 6:12]
         target_pose = proprio[:, 12:19]
@@ -162,10 +170,10 @@ class CameraPolicy(nn.Module):
         obs = torch.cat([
             joint_pos,       # 6-dim
             joint_vel,       # 6-dim
-            visual_features, # 1000-dim
+            visual_features, # 512-dim
             target_pose,     # 7-dim
             last_action,     # 6-dim
-        ], dim=-1)  # -> (B, 1025)
+        ], dim=-1)  # -> (B, 537)
 
         # Step 4: Run trained MLP actor -> (B, 6) actions
         actions = self.actor(obs)
@@ -297,7 +305,7 @@ def export_policy(
     model.eval()
 
     print(f"Loaded actor weights from iteration {iteration}")
-    print(f"Encoder: ResNet18 (frozen, pretrained on ImageNet)")
+    print(f"Encoder: ResNet18 penultimate (frozen, 512-dim avgpool features)")
     print(f"Actor: MLP {[CameraPolicy.OBS_DIM] + CameraPolicy.ACTOR_HIDDEN_DIMS + [CameraPolicy.ACTION_DIM]} with ELU")
 
     # Step 2: Count parameters
@@ -319,7 +327,8 @@ def export_policy(
             "action_dim": CameraPolicy.ACTION_DIM,
             "proprio_dim": CameraPolicy.PROPRIO_DIM,
             "proprio_layout": "joint_pos(6) + joint_vel(6) + target_pose(7) + last_action(6)",
-            "obs_layout": "joint_pos(6) + joint_vel(6) + visual_features(1000) + target_pose(7) + last_action(6)",
+            "obs_layout": "joint_pos(6) + joint_vel(6) + visual_features(512) + target_pose(7) + last_action(6)",
+            "encoder_type": "penultimate (avgpool, not FC)",
             "image_resolution": "any (resized to 224x224 internally)",
             "image_normalization": {
                 "type": "imagenet",
@@ -402,7 +411,8 @@ def export_with_random_weights(output_path: Path | None = None) -> Path:
             "action_dim": CameraPolicy.ACTION_DIM,
             "proprio_dim": CameraPolicy.PROPRIO_DIM,
             "proprio_layout": "joint_pos(6) + joint_vel(6) + target_pose(7) + last_action(6)",
-            "obs_layout": "joint_pos(6) + joint_vel(6) + visual_features(1000) + target_pose(7) + last_action(6)",
+            "obs_layout": "joint_pos(6) + joint_vel(6) + visual_features(512) + target_pose(7) + last_action(6)",
+            "encoder_type": "penultimate (avgpool, not FC)",
             "image_resolution": "any (resized to 224x224 internally)",
             "image_normalization": {
                 "type": "imagenet",
