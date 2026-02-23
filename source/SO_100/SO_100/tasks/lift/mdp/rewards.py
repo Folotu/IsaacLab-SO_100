@@ -94,23 +94,32 @@ def object_height_progress(
 
 
 def gripper_close_to_object(
-    env: ManagerBasedRLEnv, 
+    env: ManagerBasedRLEnv,
+    std: float = 0.1,
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
-    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame")
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
 ) -> torch.Tensor:
-    """Reward closing the gripper when near the object."""
-    object: RigidObject = env.scene[object_cfg.name]
+    """Reward closing the gripper when near the object.
+
+    Combines proximity (tanh kernel) with gripper closure. Encourages the agent
+    to close the gripper specifically when it is close to the object, not in free space.
+
+    The Gripper joint is the last joint (index -1) on the SO-100. Joint position
+    is 0.0 when fully closed and 0.5 when fully open (BinaryJointPositionActionCfg).
+    """
+    obj: RigidObject = env.scene[object_cfg.name]
     ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
-    
-    # Distance between object and end-effector
-    distance = torch.norm(object.data.root_pos_w - ee_frame.data.target_pos_w[..., 0, :], dim=1)
-    proximity_reward = 1.0 - distance
-    
-    # Gripper closure reward (assuming last 2 joints are gripper)
-    gripper_closure = 1.0 - env.scene["robot"].data.joint_pos[:, -2:].mean(dim=1)
-    
-    # Combine proximity and closure
-    return (proximity_reward * gripper_closure).clamp(0.0, 1.0)
+
+    # Tanh proximity kernel (bounded [0, 1])
+    distance = torch.norm(obj.data.root_pos_w - ee_frame.data.target_pos_w[..., 0, :], dim=1)
+    proximity = 1.0 - torch.tanh(distance / std)
+
+    # Gripper closure: joint_pos[-1] is the Gripper joint
+    # 0.0 = fully closed, 0.5 = fully open -> closure = 1 - 2*joint_pos
+    gripper_pos = env.scene["robot"].data.joint_pos[:, -1]
+    closure = torch.clamp(1.0 - 2.0 * gripper_pos, 0.0, 1.0)
+
+    return proximity * closure
 
 
 def gripper_orientation(
@@ -135,5 +144,139 @@ def gripper_orientation(
     
     # Reward when gripper points downward (z_axis_z is negative)
     orientation_reward = torch.clamp(-z_axis_z, 0.0, 1.0)
-    
+
     return orientation_reward
+
+
+def gripper_object_contact(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """V2 DEPRECATED: Binary contact reward. Saturates with single-body touch.
+    Kept for reference. Use gripper_grasp_quality (V3) instead."""
+    contact_sensor = env.scene[sensor_cfg.name]
+    force_magnitude = torch.norm(contact_sensor.data.net_forces_w, dim=-1)
+    max_force = force_magnitude.max(dim=-1).values
+    return (max_force > threshold).float()
+
+
+def gripper_grasp_quality(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
+    min_force: float = 0.5,
+    max_force: float = 20.0,
+    alpha: float = 0.3,
+) -> torch.Tensor:
+    """Continuous grasp quality with gradient bridge for single-to-dual jaw contact.
+
+    Uses a weighted blend: alpha * max(f1,f2) + (1-alpha) * sqrt(f1*f2).
+    The max term acts as a "magnet" (non-zero reward for single-jaw touch, keeping
+    the hand on the object). The geometric mean term acts as the "lock" (higher
+    reward when both jaws engage). This avoids the pure geometric mean's
+    zero-gradient canyon where one jaw missing kills the gradient for the other.
+
+    Contact sensor bodies: index 0 = Fixed_Gripper, index 1 = Moving_Jaw.
+    """
+    contact_sensor = env.scene[sensor_cfg.name]
+    # net_forces_w shape: (num_envs, num_bodies, 3)
+    force_per_body = torch.norm(contact_sensor.data.net_forces_w, dim=-1)
+    # force_per_body shape: (num_envs, 2)
+
+    # Continuous force scaling per body: 0 below min_force, 1 at max_force
+    scaled = torch.clamp((force_per_body - min_force) / (max_force - min_force), 0.0, 1.0)
+
+    # Weighted blend: magnet (single-jaw) + lock (dual-jaw)
+    single_jaw = scaled.max(dim=-1).values
+    dual_jaw = torch.sqrt(scaled[:, 0] * scaled[:, 1] + 1e-8)
+    return alpha * single_jaw + (1.0 - alpha) * dual_jaw
+
+
+def is_grasped(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    contact_threshold: float = 1.0,
+    min_height: float = 0.03,
+) -> torch.Tensor:
+    """V2 DEPRECATED: Binary contact gate * height. Kept for reference.
+    Use is_grasped_v3 instead."""
+    contact_sensor = env.scene[sensor_cfg.name]
+    force_magnitude = torch.norm(contact_sensor.data.net_forces_w, dim=-1)
+    has_contact = (force_magnitude.max(dim=-1).values > contact_threshold).float()
+    obj: RigidObject = env.scene[object_cfg.name]
+    height = obj.data.root_pos_w[:, 2]
+    height_above_table = torch.clamp(height - min_height, min=0.0)
+    return has_contact * height_above_table * 10.0
+
+
+def is_grasped_v3(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    min_force: float = 0.5,
+    max_force: float = 20.0,
+    min_height: float = 0.03,
+    alpha: float = 0.3,
+) -> torch.Tensor:
+    """Grasp + lift reward using blended grasp quality * height.
+
+    Uses the same gradient bridge as gripper_grasp_quality: single-jaw contact
+    provides partial signal (via alpha * max), dual-jaw provides full signal
+    (via geometric mean). Multiplied by height above table for continuous
+    gradient from poor grasp through strong grasp + lift.
+    """
+    contact_sensor = env.scene[sensor_cfg.name]
+    force_per_body = torch.norm(contact_sensor.data.net_forces_w, dim=-1)
+    scaled = torch.clamp((force_per_body - min_force) / (max_force - min_force), 0.0, 1.0)
+
+    single_jaw = scaled.max(dim=-1).values
+    dual_jaw = torch.sqrt(scaled[:, 0] * scaled[:, 1] + 1e-8)
+    grasp_quality = alpha * single_jaw + (1.0 - alpha) * dual_jaw
+
+    obj: RigidObject = env.scene[object_cfg.name]
+    height_above_table = torch.clamp(obj.data.root_pos_w[:, 2] - min_height, min=0.0)
+
+    return grasp_quality * height_above_table * 10.0
+
+
+def object_upward_velocity(
+    env: ManagerBasedRLEnv,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+) -> torch.Tensor:
+    """Reward any upward object velocity. Provides immediate gradient for lifting
+    before height thresholds are crossed — the missing signal between contact and lift."""
+    obj: RigidObject = env.scene[object_cfg.name]
+    return torch.clamp(obj.data.root_lin_vel_w[:, 2], 0.0, 1.0)
+
+
+def lifting_success_bonus(
+    env: ManagerBasedRLEnv,
+    threshold: float = 0.05,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+) -> torch.Tensor:
+    """One-time bonus when the object first crosses the lift threshold.
+
+    Unlike per-step lifting rewards that fire every step above threshold,
+    this fires ONCE per crossing event. GAE propagates this massive spike
+    back through the entire trajectory, creating high advantage at the
+    grasping action that preceded the lift.
+
+    Resets when the object drops back below threshold (so each distinct
+    lift attempt gets its own bonus). Also naturally resets on env reset
+    since the object returns to its initial height.
+    """
+    obj: RigidObject = env.scene[object_cfg.name]
+    above = obj.data.root_pos_w[:, 2] > threshold
+
+    if not hasattr(env, '_lift_bonus_given'):
+        env._lift_bonus_given = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    # Bonus fires on the step where above transitions from False to True
+    first_cross = above & (~env._lift_bonus_given)
+    env._lift_bonus_given = env._lift_bonus_given | above
+
+    # Reset when object drops back below threshold (catches env resets too)
+    env._lift_bonus_given = env._lift_bonus_given & above
+
+    return first_cross.float()

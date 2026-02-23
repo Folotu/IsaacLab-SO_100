@@ -19,7 +19,7 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import FrameTransformerCfg, TiledCameraCfg
+from isaaclab.sensors import ContactSensorCfg, FrameTransformerCfg, TiledCameraCfg
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
 from isaaclab.sim.schemas.schemas_cfg import RigidBodyPropertiesCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg, UsdFileCfg
@@ -55,6 +55,9 @@ class ObjectTableSceneCfg(InteractiveSceneCfg):
 
     # optional tiled camera sensor (set by camera-enabled env variants)
     tiled_camera: TiledCameraCfg | None = None
+
+    # optional contact sensor for gripper-object contact detection (set by camera-enabled env variants)
+    contact_sensor: ContactSensorCfg | None = None
 
     # Table
     table = AssetBaseCfg(
@@ -222,6 +225,222 @@ class AsymmetricCameraObsCfg:
     # observation groups
     policy: PolicyCfg = PolicyCfg()
     critic: CriticCfg = CriticCfg()
+
+
+@configclass
+class SpatialCameraObsCfg:
+    """Asymmetric actor-critic observations with spatial softmax visual features.
+
+    Replaces avgpool (penultimate_image_features) with spatial softmax keypoints
+    (spatial_image_features) from ResNet18 layer3. Same 512-dim output but encodes
+    WHERE features activate spatially, not just WHAT features are present.
+
+    Actor obs dim: joint_pos(6) + joint_vel(6) + spatial_features(512) + target(7) + action(6) = 537
+    Critic obs dim: joint_pos(6) + joint_vel(6) + object_position(3) + target(7) + action(6) = 28
+    """
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+        """Actor observations with 512-dim spatial softmax keypoints."""
+
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        visual_features = ObsTerm(
+            func=local_mdp.spatial_image_features,
+            params={
+                "sensor_cfg": SceneEntityCfg("tiled_camera"),
+                "data_type": "rgb",
+            },
+        )
+        target_object_position = ObsTerm(func=mdp.generated_commands, params={"command_name": "object_pose"})
+        actions = ObsTerm(func=mdp.last_action)
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    @configclass
+    class CriticCfg(ObsGroup):
+        """Critic observations with privileged ground-truth object position."""
+
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        object_position = ObsTerm(func=local_mdp.object_position_in_robot_root_frame)
+        target_object_position = ObsTerm(func=mdp.generated_commands, params={"command_name": "object_pose"})
+        actions = ObsTerm(func=mdp.last_action)
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
+
+
+@configclass
+class ProductionCameraObsCfg:
+    """Production observation config: 3-frame stacked spatial softmax + critic with velocity.
+
+    Actor sees temporal visual features (3 × 512 = 1536-dim) enabling velocity inference
+    from frame differences. Critic sees ground-truth object position + velocity for accurate
+    value estimation during lifting.
+
+    Actor obs: joint_pos(6) + joint_vel(6) + stacked_visual(1536) + target(7) + action(6) = 1561
+    Critic obs: joint_pos(6) + joint_vel(6) + object_pos(3) + object_vel(3) + target(7) + action(6) = 31
+    """
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+        """Actor with 3-frame stacked spatial softmax for temporal awareness."""
+
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        visual_features = ObsTerm(
+            func=local_mdp.stacked_spatial_image_features,
+            params={
+                "sensor_cfg": SceneEntityCfg("tiled_camera"),
+                "data_type": "rgb",
+                "num_frames": 3,
+            },
+        )
+        target_object_position = ObsTerm(func=mdp.generated_commands, params={"command_name": "object_pose"})
+        actions = ObsTerm(func=mdp.last_action)
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    @configclass
+    class CriticCfg(ObsGroup):
+        """Critic with object position + velocity (privileged)."""
+
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        object_position = ObsTerm(func=local_mdp.object_position_in_robot_root_frame)
+        object_velocity = ObsTerm(func=local_mdp.object_linear_velocity)
+        target_object_position = ObsTerm(func=mdp.generated_commands, params={"command_name": "object_pose"})
+        actions = ObsTerm(func=mdp.last_action)
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
+
+
+@configclass
+class CameraRewardsCfgSimple:
+    """Simple reward terms matching the state-based policy that successfully lifts."""
+
+    reaching_object = RewTerm(func=mdp.object_ee_distance, params={"std": 0.1}, weight=1.0)
+    lifting_object = RewTerm(func=mdp.object_is_lifted, params={"minimal_height": 0.04}, weight=15.0)
+    object_goal_tracking = RewTerm(
+        func=mdp.object_goal_distance,
+        params={"std": 0.3, "minimal_height": 0.04, "command_name": "object_pose"},
+        weight=16.0,
+    )
+    object_goal_tracking_fine_grained = RewTerm(
+        func=mdp.object_goal_distance,
+        params={"std": 0.05, "minimal_height": 0.04, "command_name": "object_pose"},
+        weight=5.0,
+    )
+    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
+    joint_vel = RewTerm(
+        func=mdp.joint_vel_l2,
+        weight=-1e-4,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+
+
+@configclass
+class CameraRewardsDiscovery:
+    """Phase 1 'Trash-Thrash' rewards: loud lifting signal, near-zero penalties.
+
+    The 10x rule for vision RL: the lifting jackpot (30.0) must be 10x+ larger
+    than the reaching participation trophy (1.0). Agent gets only 3% of possible
+    return by hovering — massive gradient pressure to find the other 97%.
+
+    Penalties are effectively zero to allow the high-variance jittery exploration
+    that the spatial softmax encoder needs to learn visual-motor associations.
+    The agent will look ugly. That's the point.
+    """
+
+    # Low "participation trophy" — just enough to guide toward the cube
+    reaching_object = RewTerm(func=mdp.object_ee_distance, params={"std": 0.1}, weight=1.0)
+
+    # LOUD lifting signal — 2x state-based to survive gradient dilution across 512 envs
+    lifting_object = RewTerm(func=mdp.object_is_lifted, params={"minimal_height": 0.04}, weight=30.0)
+
+    # Goal tracking (same as state-based, gated on height)
+    object_goal_tracking = RewTerm(
+        func=mdp.object_goal_distance,
+        params={"std": 0.3, "minimal_height": 0.04, "command_name": "object_pose"},
+        weight=16.0,
+    )
+    object_goal_tracking_fine_grained = RewTerm(
+        func=mdp.object_goal_distance,
+        params={"std": 0.05, "minimal_height": 0.04, "command_name": "object_pose"},
+        weight=5.0,
+    )
+
+    # Near-zero penalties — do NOT penalize the jitter needed for discovery
+    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
+    joint_vel = RewTerm(
+        func=mdp.joint_vel_l2,
+        weight=-1e-4,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+
+
+@configclass
+class CameraRewardsAmplified:
+    """Phase 1.5 'Amplifier' rewards: massive lifting signal to survive 512-env gradient dilution.
+
+    The Discovery config (weight=30) produced consistent lifting spikes but PPO couldn't
+    reinforce them — the signal was drowned out by 510 non-lifting envs. This config
+    amplifies the signal 16x:
+
+    - lifting_object: 30 → 500 (per-step when object above 0.04m)
+    - upward_velocity: restored at weight=50 (continuous gradient for ANY upward motion)
+    - reaching: 1.0 → 2.0 (slightly boost approach stability)
+
+    Math: 1 env lifting for 5 steps = 500*5 = 2500. Reaching return for 512 envs = 512*~20 = 10240.
+    Lift contribution: 2500/10240 ≈ 24% of batch return from a SINGLE env. PPO can see this.
+    """
+
+    # Stable approach
+    reaching_object = RewTerm(func=mdp.object_ee_distance, params={"std": 0.1}, weight=2.0)
+
+    # Continuous gradient for ANY upward object motion — bridges the binary lift threshold
+    upward_velocity = RewTerm(func=local_mdp.object_upward_velocity, weight=100.0)
+
+    # MASSIVE per-step lifting signal — must survive averaging across 512 envs
+    lifting_object = RewTerm(func=mdp.object_is_lifted, params={"minimal_height": 0.04}, weight=500.0)
+
+    # One-time bonus on first lift crossing — GAE propagates this spike back through
+    # the entire trajectory, creating high advantage at the grasping action
+    lift_bonus = RewTerm(func=local_mdp.lifting_success_bonus, params={"threshold": 0.05}, weight=1000.0)
+
+    # Goal tracking (same weights — these activate once object is lifted)
+    object_goal_tracking = RewTerm(
+        func=mdp.object_goal_distance,
+        params={"std": 0.3, "minimal_height": 0.04, "command_name": "object_pose"},
+        weight=16.0,
+    )
+    object_goal_tracking_fine_grained = RewTerm(
+        func=mdp.object_goal_distance,
+        params={"std": 0.05, "minimal_height": 0.04, "command_name": "object_pose"},
+        weight=5.0,
+    )
+
+    # Near-zero penalties
+    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
+    joint_vel = RewTerm(
+        func=mdp.joint_vel_l2,
+        weight=-1e-4,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
 
 
 @configclass
@@ -409,6 +628,76 @@ class CameraRewardsCfg:
 
 
 @configclass
+class CameraRewardsCfgV2:
+    """Reward terms for camera-based MDP v2 -- contact-based grasp rewards.
+
+    Addresses the reaching-to-grasping gap that caused training collapse with
+    CameraRewardsCfg. Key changes:
+    1. Replaced binary object_is_lifted with continuous object_height_progress
+    2. Added gripper_object_contact to reward actual cube contact
+    3. Added is_grasped to reward contact + height (bridges grasping to lifting)
+    4. Added gripper_close_to_object to encourage closing gripper near cube
+    5. Added gripper_orientation to encourage proper downward grasp pose
+
+    Reward weights tuned so the agent progresses through:
+    reaching (5.0) -> orientation (2.0) -> close gripper (5.0) -> contact (10.0)
+    -> grasp+lift (25.0) -> height progress (15.0) -> goal tracking (16.0 + 5.0)
+    """
+
+    # Phase 1: Approach -- same as v1
+    reaching_object = RewTerm(func=mdp.object_ee_distance, params={"std": 0.1}, weight=5.0)
+
+    # Phase 2: Pre-grasp alignment (local_mdp = SO_100/tasks/lift/mdp/)
+    gripper_orientation = RewTerm(func=local_mdp.gripper_orientation, weight=2.0)
+    gripper_close_to_object = RewTerm(
+        func=local_mdp.gripper_close_to_object,
+        params={"std": 0.1},
+        weight=5.0,
+    )
+
+    # Phase 3: Contact -- bridges reaching to grasping
+    gripper_contact = RewTerm(
+        func=local_mdp.gripper_object_contact,
+        params={"sensor_cfg": SceneEntityCfg("contact_sensor"), "threshold": 1.0},
+        weight=10.0,
+    )
+
+    # Phase 4: Grasp + lift -- bridges grasping to lifting (contact * height)
+    grasp_lift = RewTerm(
+        func=local_mdp.is_grasped,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_sensor"),
+            "contact_threshold": 1.0,
+            "min_height": 0.03,
+        },
+        weight=25.0,
+    )
+
+    # Phase 5: Continuous height progress (replaces binary object_is_lifted)
+    height_progress = RewTerm(func=local_mdp.object_height_progress, weight=15.0)
+
+    # Phase 6: Goal tracking (same as v1)
+    object_goal_tracking = RewTerm(
+        func=mdp.object_goal_distance,
+        params={"std": 0.3, "minimal_height": 0.04, "command_name": "object_pose"},
+        weight=16.0,
+    )
+    object_goal_tracking_fine_grained = RewTerm(
+        func=mdp.object_goal_distance,
+        params={"std": 0.05, "minimal_height": 0.04, "command_name": "object_pose"},
+        weight=5.0,
+    )
+
+    # Penalties (same as v1)
+    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
+    joint_vel = RewTerm(
+        func=mdp.joint_vel_l2,
+        weight=-1e-4,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+
+
+@configclass
 class CameraCurriculumCfg:
     """Curriculum terms for camera-based MDP.
 
@@ -425,6 +714,129 @@ class CameraCurriculumCfg:
     joint_vel = CurrTerm(
         func=mdp.modify_reward_weight,
         params={"term_name": "joint_vel", "weight": -1e-2, "num_steps": 1000000}
+    )
+
+
+@configclass
+class CameraCurriculumCfgV2:
+    """Curriculum terms for camera-based MDP v2 (contact rewards).
+
+    Slightly faster penalty ramp than v1 (500K vs 1M steps) since contact rewards
+    provide denser signal earlier. Final penalty remains small (-0.01) to avoid
+    overwhelming the grasp reward gradient.
+    """
+
+    action_rate = CurrTerm(
+        func=mdp.modify_reward_weight,
+        params={"term_name": "action_rate", "weight": -1e-2, "num_steps": 500000}
+    )
+
+    joint_vel = CurrTerm(
+        func=mdp.modify_reward_weight,
+        params={"term_name": "joint_vel", "weight": -1e-2, "num_steps": 500000}
+    )
+
+
+@configclass
+class CameraRewardsCfgV3:
+    """Reward terms for camera-based MDP v3 -- continuous dual-body grasp quality.
+
+    Fixes V2's binary contact saturation trap. Key changes:
+    1. gripper_contact uses geometric mean of both jaw forces (not binary max)
+    2. grasp_lift uses continuous grasp quality gate (not binary contact gate)
+    3. Added object_upward_velocity for immediate lift gradient
+    4. Reduced reaching weight (2.0 vs 5.0) to shrink easy-reward pool
+
+    Reward gradient: hover (5.9) -> press 1 jaw (5.9) -> dual grasp (12.3)
+    -> nudge upward (17.3) -> full lift (37+). No comfortable plateau.
+    """
+
+    # Phase 1: Approach -- reduced weight to shrink easy-reward pool
+    reaching_object = RewTerm(func=mdp.object_ee_distance, params={"std": 0.1}, weight=2.0)
+
+    # Phase 2: Pre-grasp alignment
+    gripper_orientation = RewTerm(func=local_mdp.gripper_orientation, weight=2.0)
+    gripper_close_to_object = RewTerm(
+        func=local_mdp.gripper_close_to_object,
+        params={"std": 0.1},
+        weight=5.0,
+    )
+
+    # Phase 3: Continuous dual-body grasp quality (replaces binary contact)
+    # Geometric mean: zero for single-jaw press, high for proper dual-jaw grasp
+    # Curriculum decays this from 8 -> 2 after 300K steps
+    gripper_contact = RewTerm(
+        func=local_mdp.gripper_grasp_quality,
+        params={"sensor_cfg": SceneEntityCfg("contact_sensor"),
+                "min_force": 0.5, "max_force": 20.0},
+        weight=8.0,
+    )
+
+    # Phase 4: Grasp + lift using continuous grasp quality * height
+    # Curriculum grows this from 35 -> 50 after 300K steps
+    grasp_lift = RewTerm(
+        func=local_mdp.is_grasped_v3,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_sensor"),
+            "min_force": 0.5, "max_force": 20.0, "min_height": 0.03,
+        },
+        weight=35.0,
+    )
+
+    # Phase 4.5: Upward velocity -- immediate gradient for any lift motion
+    # Bridges contact -> height threshold gap
+    upward_velocity = RewTerm(func=local_mdp.object_upward_velocity, weight=5.0)
+
+    # Phase 5: Continuous height progress
+    height_progress = RewTerm(func=local_mdp.object_height_progress, weight=15.0)
+
+    # Phase 6: Goal tracking
+    object_goal_tracking = RewTerm(
+        func=mdp.object_goal_distance,
+        params={"std": 0.3, "minimal_height": 0.04, "command_name": "object_pose"},
+        weight=16.0,
+    )
+    object_goal_tracking_fine_grained = RewTerm(
+        func=mdp.object_goal_distance,
+        params={"std": 0.05, "minimal_height": 0.04, "command_name": "object_pose"},
+        weight=5.0,
+    )
+
+    # Penalties
+    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
+    joint_vel = RewTerm(
+        func=mdp.joint_vel_l2,
+        weight=-1e-4,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+
+
+@configclass
+class CameraCurriculumCfgV3:
+    """Curriculum for V3: decay contact reward, boost lift reward.
+
+    After 300K steps: contact drops 8->2 (stop rewarding contact for its own sake),
+    grasp_lift grows 35->50 (make lifting the dominant signal).
+    """
+
+    contact_decay = CurrTerm(
+        func=mdp.modify_reward_weight,
+        params={"term_name": "gripper_contact", "weight": 2.0, "num_steps": 300000}
+    )
+
+    grasp_lift_growth = CurrTerm(
+        func=mdp.modify_reward_weight,
+        params={"term_name": "grasp_lift", "weight": 50.0, "num_steps": 300000}
+    )
+
+    action_rate = CurrTerm(
+        func=mdp.modify_reward_weight,
+        params={"term_name": "action_rate", "weight": -1e-2, "num_steps": 500000}
+    )
+
+    joint_vel = CurrTerm(
+        func=mdp.modify_reward_weight,
+        params={"term_name": "joint_vel", "weight": -1e-2, "num_steps": 500000}
     )
 
 
@@ -630,10 +1042,11 @@ class SoArm100CubeLiftCameraEnvCfg(SoArm100CubeCubeLiftEnvCfg):
         self.scene.ee_frame.debug_vis = False
         self.scene.cube_marker.debug_vis = False
 
-        # Camera-specific rewards: boosted positive signals, gentler penalties
-        self.rewards = CameraRewardsCfg()
-        # Camera-specific curriculum: 100x slower penalty ramp, 10x smaller final penalty
-        self.curriculum = CameraCurriculumCfg()
+        # Phase 1.5 "Amplifier" rewards: massive lifting signal to survive gradient dilution
+        self.rewards = CameraRewardsAmplified()
+        # NO curriculum — penalties stay at -1e-4 throughout. Add penalties in Phase 2
+        # after the agent learns to lift reliably (>50% success rate).
+        self.curriculum = None
 
         # Kornia-based augmentation events (fires every step via interval mode)
         self.events = KorniaAugmentEventCfg()
@@ -641,14 +1054,14 @@ class SoArm100CubeLiftCameraEnvCfg(SoArm100CubeCubeLiftEnvCfg):
         # Asymmetric actor-critic observations:
         # - Policy group: 512-dim penultimate ResNet18 features + proprioception (actor)
         # - Critic group: ground-truth object position + proprioception (privileged)
-        self.observations = AsymmetricCameraObsCfg()
+        self.observations = ProductionCameraObsCfg()
 
         # Mount TiledCamera on the Fixed_Gripper link (gripper body where a real wrist camera mounts)
         self.scene.tiled_camera = TiledCameraCfg(
             prim_path="{ENV_REGEX_NS}/Robot/Fixed_Gripper/wrist_cam",
             update_period=0.0,  # update every render step
-            height=84,
-            width=84,
+            height=128,
+            width=128,
             data_types=["rgb"],
             spawn=sim_utils.PinholeCameraCfg(
                 focal_length=2.12,
@@ -661,6 +1074,17 @@ class SoArm100CubeLiftCameraEnvCfg(SoArm100CubeCubeLiftEnvCfg):
                 rot=(0.1132, 0.9936, 0.0, 0.0),  # Euler X=167deg - forward-looking, matching real camera view
                 convention="opengl",
             ),
+        )
+
+        # Contact sensor on gripper bodies for grasp reward (reward signal only, not observation)
+        # USD body names: Fixed_Gripper (fixed jaw) and Moving_Jaw (actuated jaw)
+        # No filter_prim_paths_expr: we use net_forces_w (aggregate) not force_matrix_w (filtered).
+        # filter causes PhysX tensor mismatch when sensor has 2 bodies but filter has 1 per env.
+        self.scene.contact_sensor = ContactSensorCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/(Fixed_Gripper|Moving_Jaw)",
+            update_period=0.0,
+            history_length=0,
+            debug_vis=False,
         )
 
 
